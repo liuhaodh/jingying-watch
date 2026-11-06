@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#0A0A0C</color>
+    <color name="bg_elevated">#151519</color>
+    <color name="bg_card">#1B1B21</color>
+    <color name="line">#26262E</color>
+    <color name="text">#F7F7FA</color>
+    <color name="text_dim">#9C9CA8</color>
+    <color name="text_faint">#6C6C78</color>
+    <color name="accent">#FE2C55</color>
+    <color name="cyan">#25F4EE</color>
+    <color name="black">#000000</color>
+    <color name="white">#FFFFFF</color>
+</resources>

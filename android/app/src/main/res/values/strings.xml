@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">净影 · 观看</string>
+    <string name="app_sub">观看已下载</string>
+    <string name="feed_empty">片库里还没有作品</string>
+    <string name="need_setup">先连接 WebDAV 片库</string>
+</resources>

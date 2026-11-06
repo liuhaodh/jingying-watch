@@ -1,0 +1,20 @@
+﻿# 构建中间产物
+android/build/
+*.idsig
+
+# 签名文件（build.ps1 缺失时会自动重新生成）
+*.keystore
+
+# Python
+__pycache__/
+*.pyc
+
+# 演示片库（用 python tools/make_fixtures.py 重新生成）
+tools/fixtures/
+
+# 本机缓存
+JingYingWatchData/
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
