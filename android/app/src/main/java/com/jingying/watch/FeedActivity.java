@@ -13,6 +13,7 @@ import android.media.AudioManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.net.Uri;
 import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
@@ -25,6 +26,7 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -43,6 +45,10 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
     private int storeRevision;
     /** 回收站预览：作品不在片库里，下载/收藏/删除都禁用。 */
     private boolean preview;
+    /** 分享打包：一次只跑一个，Activity 销毁时让后台任务自己收尾。 */
+    private boolean sharing;
+    private volatile boolean shareCancelled;
+    private android.app.AlertDialog shareBusy;
     private AudioManager audioManager;
     private boolean focusHeld;
     private final AudioManager.OnAudioFocusChangeListener focusListener = change -> {
@@ -69,7 +75,11 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
     private final Runnable ticker = new Runnable() {
         @Override
         public void run() {
-            if (resumed && pager != null) {
+            if (!resumed) {
+                // 退到后台就停掉，别每 220ms 空转把自己唤醒
+                return;
+            }
+            if (pager != null) {
                 pager.updateProgress();
             }
             handler.postDelayed(this, 220L);
@@ -108,6 +118,10 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
             Ui.toast(this, "回收站预览：恢复后才能下载、收藏");
         }
         storeRevision = app.store.revision();
+        if (!preview) {
+            // setItems 不一定触发 onPageChanged；这里补一次，打开就预热后面十个
+            prefetchAhead(FeedSession.index());
+        }
         handler.postDelayed(ticker, 300L);
     }
 
@@ -116,6 +130,7 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
         if (preview) {
             return;
         }
+        FeedSession.setIndex(index);
         if (work != null) {
             prefs.setLast(work.key(), index);
         }
@@ -124,18 +139,41 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
         maybeAutoDownload(work);
     }
 
-    /** 提前把后面两条的详情读出来，滑动时不用等 PROPFIND。 */
+    /** 播放时提前把后面 10 个作品的详情读出来，并给普通视频预热开头 2MB。 */
+    private static final int PREFETCH_AHEAD = 10;
+    private static final long PREFETCH_BYTES = 2L * 1024 * 1024;
+
     private void prefetchAhead(int index) {
-        for (int offset = 1; offset <= 2; offset++) {
+        for (int offset = 1; offset <= PREFETCH_AHEAD; offset++) {
             Work work = pager.workAt(index + offset);
             if (work == null) {
                 break;
             }
-            if (!work.detailsLoaded && !work.empty) {
+            if (work.detailsLoaded) {
+                prefetchMedia(work);
+            } else if (!work.empty) {
                 app.scanner.loadDetails(work, (target, ok, error) -> {
+                    if (ok) {
+                        prefetchMedia(target);
+                    }
                 });
             }
         }
+    }
+
+    /**
+     * 给后面作品的视频预热开头一小段（整段下载会吃掉带宽和存储）。
+     * 作品包的视频要先解包才能播，预热只能到「详情」为止；切到该条时再解。
+     */
+    private void prefetchMedia(Work work) {
+        if (work == null || work.video == null) {
+            return;
+        }
+        if (work.video.inArchive()) {
+            return;
+        }
+        app.proxy.prefetchPrefix(work.video.rel, work.video.name, work.video.size,
+                PREFETCH_BYTES);
     }
 
     @Override
@@ -147,7 +185,7 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
             case FeedPage.HIT_MUTE:
                 toggleMute();
                 break;
-            case FeedPage.HIT_COMMENT:
+            case FeedPage.HIT_DETAIL:
                 showInfo(page);
                 break;
             case FeedPage.HIT_SHARE:
@@ -186,7 +224,24 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
 
     @Override
     public void onDoubleTap(FeedPage page, float x, float y) {
-        // 已去掉点赞按钮，双击不再触发点赞
+        if (preview) {
+            Ui.toast(this, "回收站预览：恢复后才能收藏");
+            return;
+        }
+        Work work = page == null ? null : page.work();
+        if (work == null) {
+            return;
+        }
+        // 双击是「点赞式收藏」：只加不减，再双击已收藏的作品不会误取消。
+        if (app.favorites.isFavorite(work.rel)) {
+            Ui.toast(this, "已在收藏夹");
+        } else {
+            app.favorites.toggle(work.rel);
+            page.refreshFavoriteState();
+            page.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+            Ui.toast(this, "已收藏，可在首页「收藏」里看");
+        }
+        page.showFavoriteBurst(x, y);
     }
 
     @Override
@@ -206,10 +261,9 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
         } else {
             String needle = token.toLowerCase(Locale.US);
             for (Work work : base) {
-                String hay = (work.displayTitle() + " "
-                        + (work.captionText == null ? "" : work.captionText))
-                        .toLowerCase(Locale.US);
-                if (hay.contains(needle)) {
+                // searchText() 是带缓存的规范化文本，和首页搜索同一套；
+                // 以前每条都现拼 caption 再 toLowerCase，一万条就是几万个临时字符串
+                if (work.searchText().contains(needle)) {
                     filtered.add(work);
                 }
             }
@@ -397,7 +451,25 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
         boolean muted = !prefs.muted();
         prefs.setMuted(muted);
         pager.setMuted(muted);
+        // 静音时就不该继续占着音频焦点，否则会把别的 App 正在放的音乐掐掉
+        syncAudioFocus();
         Ui.toast(this, muted ? "已静音" : "已开启声音");
+    }
+
+    /** 只有「前台 + 没静音」才持有音频焦点；其余情况及时还回去。 */
+    private void syncAudioFocus() {
+        if (audioManager == null) {
+            return;
+        }
+        boolean want = resumed && prefs != null && !prefs.muted();
+        if (want && !focusHeld) {
+            int result = audioManager.requestAudioFocus(focusListener,
+                    AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+            focusHeld = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+        } else if (!want && focusHeld) {
+            audioManager.abandonAudioFocus(focusListener);
+            focusHeld = false;
+        }
     }
 
     private void toggleAutoDownload(FeedPage page) {
@@ -431,21 +503,94 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
         }
     }
 
+    /** 分享：先把作品的全部文件打包成一个 tar，再用临时授权的 content:// 发出去。 */
     private void share(FeedPage page) {
         Work work = page.work();
         if (work == null) {
             return;
         }
-        String text = work.captionLine();
-        String link = work.shareUrl;
-        if (link != null && !link.isEmpty()) {
-            text = text + "\n" + link;
+        if (preview) {
+            Ui.toast(this, "回收站预览：恢复后才能分享");
+            return;
         }
+        if (sharing) {
+            Ui.toast(this, "正在打包作品文件…");
+            return;
+        }
+        sharing = true;
+        shareCancelled = false;
+        final android.app.AlertDialog busy = Ui.busy(this, "正在打包作品文件…");
+        shareBusy = busy;
+        if (busy != null) {
+            busy.setButton(android.app.AlertDialog.BUTTON_NEGATIVE, "取消",
+                    (dialog, which) -> shareCancelled = true);
+        }
+        final Work target = work;
+        app.io.execute(() -> {
+            File tar = null;
+            String error = null;
+            try {
+                tar = WorkShare.build(app, target, new WorkShare.Progress() {
+                    @Override
+                    public void onProgress(int percent, String stage) {
+                        final String message = stage + "  " + percent + "%";
+                        runOnUiThread(() -> {
+                            if (busy != null && busy.isShowing()) {
+                                busy.setMessage(message);
+                            }
+                        });
+                    }
+
+                    @Override
+                    public boolean isCancelled() {
+                        return shareCancelled;
+                    }
+                });
+            } catch (Exception exc) {
+                error = exc.getMessage() == null ? "打包失败" : exc.getMessage();
+            }
+            final File result = tar;
+            final String failure = error;
+            runOnUiThread(() -> {
+                sharing = false;
+                shareBusy = null;
+                Ui.dismiss(busy);
+                if (isFinishing() || isDestroyed() || shareCancelled) {
+                    return;
+                }
+                if (result == null) {
+                    Ui.toast(this, "打包失败：" + failure);
+                    return;
+                }
+                sendTar(result, target);
+            });
+        });
+    }
+
+    private void sendTar(File tar, Work work) {
+        Uri uri = ShareProvider.uriFor(tar.getName());
         Intent intent = new Intent(Intent.ACTION_SEND);
-        intent.setType("text/plain");
-        intent.putExtra(Intent.EXTRA_TEXT, text);
-        intent.putExtra(Intent.EXTRA_SUBJECT, work.displayAuthor());
-        startActivity(Intent.createChooser(intent, "分享作品"));
+        intent.setType(ShareProvider.MIME);
+        intent.putExtra(Intent.EXTRA_STREAM, uri);
+        intent.putExtra(Intent.EXTRA_SUBJECT, work.displayTitle());
+        String text = work.captionLine();
+        if (work.shareUrl != null && !work.shareUrl.isEmpty()) {
+            text = text.isEmpty() ? work.shareUrl : text + "\n" + work.shareUrl;
+        }
+        if (!text.isEmpty()) {
+            intent.putExtra(Intent.EXTRA_TEXT, text);
+        }
+        // EXTRA_STREAM 在部分系统上不自动授予读权限，clipData + flag 双保险
+        intent.setClipData(ClipData.newUri(getContentResolver(), "作品文件", uri));
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        Intent chooser = Intent.createChooser(intent, "分享作品文件");
+        chooser.setClipData(ClipData.newUri(getContentResolver(), "作品文件", uri));
+        chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivity(chooser);
+        } catch (android.content.ActivityNotFoundException exc) {
+            Ui.toast(this, "没有能接收 tar 文件的应用；文件已存到 " + tar.getAbsolutePath());
+        }
     }
 
     private void openAuthorPage(FeedPage page) {
@@ -589,11 +734,7 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
         super.onResume();
         resumed = true;
         Ui.enterImmersive(this);
-        if (audioManager != null) {
-            int result = audioManager.requestAudioFocus(focusListener,
-                    AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
-            focusHeld = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
-        }
+        syncAudioFocus();
         IntentFilter noisyFilter = new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY);
         if (android.os.Build.VERSION.SDK_INT >= 33) {
             registerReceiver(noisyReceiver, noisyFilter, Context.RECEIVER_NOT_EXPORTED);
@@ -626,6 +767,7 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
     protected void onPause() {
         super.onPause();
         resumed = false;
+        handler.removeCallbacks(ticker);
         try {
             unregisterReceiver(noisyReceiver);
         } catch (Exception ignored) {
@@ -650,6 +792,9 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
     @Override
     protected void onDestroy() {
         handler.removeCallbacksAndMessages(null);
+        shareCancelled = true;
+        Ui.dismiss(shareBusy);
+        shareBusy = null;
         if (pager != null) {
             pager.destroy();
         }

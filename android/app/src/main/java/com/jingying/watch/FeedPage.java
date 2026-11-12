@@ -37,14 +37,14 @@ import java.util.List;
 
 /**
  * 一屏作品：竖屏视频（TextureView + MediaPlayer）或图集，
- * 底部作者/文案/音乐/进度，右侧点赞收藏分享，布局对齐抖音。
+ * 底部作者/文案/音乐/进度，右侧收藏分享详情，布局对齐抖音。
  */
 public final class FeedPage extends FrameLayout {
 
     public static final int HIT_NONE = 0;
     public static final int HIT_BACK = 1;
     public static final int HIT_MUTE = 2;
-    public static final int HIT_COMMENT = 4;
+    public static final int HIT_DETAIL = 4;
     public static final int HIT_SHARE = 6;
     public static final int HIT_AVATAR = 7;
     public static final int HIT_PROGRESS = 8;
@@ -99,10 +99,11 @@ public final class FeedPage extends FrameLayout {
     private ImageView downloadIcon;
     private TextView downloadPercent;
     private ImageView autoIcon;
-    private ImageView commentIcon;
+    private ImageView detailIcon;
     private ImageView shareIcon;
     private ImageView favoriteIcon;
     private TextView favoriteLabel;
+    private HeartBurstView heartBurst;
     private ImageView playIcon;
     private ImageView musicIcon;
     private LoadingDotsView spinner;
@@ -114,6 +115,18 @@ public final class FeedPage extends FrameLayout {
 
     private MediaPlayer player;
     private MediaPlayer musicPlayer;
+    /** 作品包里的成员解到本地后的路径（同一个作品复用，切走不删缓存）。 */
+    private java.io.File archiveVideo;
+    private java.io.File archiveMusic;
+    private boolean archiveVideoLoading;
+    private boolean archiveMusicLoading;
+    /** 作品包解包偶发失败时给音乐两次重试机会，别让一次抖动整条没声音。 */
+    private int archiveMusicRetries;
+    private final Runnable musicRetry = this::prepareMusic;
+    /** 一个作品在一屏里只主动查一次独立音乐目录，避免轮播/回调重复 PROPFIND。 */
+    private boolean musicLookupDone;
+    /** 页面已经 destroy() 后，解包回调用不着再起播放器。 */
+    private boolean pageDestroyed;
     private boolean musicPrepared;
     private boolean visualReady;
     private boolean albumPaused;
@@ -407,15 +420,17 @@ public final class FeedPage extends FrameLayout {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         rail.addView(railSpacer(18));
-        commentIcon = railIcon(R.drawable.ic_comment, "评论");
-        rail.addView((View) commentIcon.getParent());
+        // 侧栏顺序：收藏 → 分享 → 详情 → 自动下载。收藏与原来的「评论」对调；
+        // 原「评论」点开的其实是详情弹层，现在图标和文案也一并对上。
+        favoriteIcon = railIcon(R.drawable.ic_star, "收藏");
+        favoriteLabel = (TextView) ((ViewGroup) favoriteIcon.getParent()).getChildAt(1);
+        rail.addView((View) favoriteIcon.getParent());
         rail.addView(railSpacer(14));
         shareIcon = railIcon(R.drawable.ic_share, "分享");
         rail.addView((View) shareIcon.getParent());
         rail.addView(railSpacer(14));
-        favoriteIcon = railIcon(R.drawable.ic_star, "收藏");
-        favoriteLabel = (TextView) ((ViewGroup) favoriteIcon.getParent()).getChildAt(1);
-        rail.addView((View) favoriteIcon.getParent());
+        detailIcon = railIcon(R.drawable.ic_info, "详情");
+        rail.addView((View) detailIcon.getParent());
         rail.addView(railSpacer(14));
         autoIcon = railIcon(R.drawable.ic_download, "自动下载");
         autoLabel = (TextView) ((ViewGroup) autoIcon.getParent()).getChildAt(1);
@@ -464,6 +479,10 @@ public final class FeedPage extends FrameLayout {
         playIcon = Ui.bigIcon(getContext(), R.drawable.ic_play, 26, 0xF2FFFFFF);
         playIcon.setVisibility(GONE);
         playIcon.setBackgroundColor(0x00000000);
+        // 双击收藏的心心动画：铺满整屏、不拦截触摸，叠在最后一层
+        heartBurst = new HeartBurstView(getContext());
+        addView(heartBurst, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         updateMuteIcon();
     }
 
@@ -510,6 +529,7 @@ public final class FeedPage extends FrameLayout {
     }
 
     public void bind(Work work, int index, int total) {
+        pageDestroyed = false;
         if (this.work == work) {
             this.index = index;
             counterSuffix = " / " + total;
@@ -520,6 +540,14 @@ public final class FeedPage extends FrameLayout {
         }
         releasePlayers();
         this.work = work;
+        pageDestroyed = false;
+        archiveVideo = null;
+        archiveMusic = null;
+        archiveVideoLoading = false;
+        archiveMusicLoading = false;
+        archiveMusicRetries = 0;
+        musicLookupDone = false;
+        handler.removeCallbacks(musicRetry);
         this.index = index;
         counterSuffix = " / " + total;
         prepared = false;
@@ -538,6 +566,7 @@ public final class FeedPage extends FrameLayout {
         videoWidth = 0;
         videoHeight = 0;
         errorText.setVisibility(GONE);
+        spinner.stop();
         spinner.setVisibility(GONE);
         playGlyph.setVisibility(GONE);
         progressLine.setProgress(0f);
@@ -546,6 +575,9 @@ public final class FeedPage extends FrameLayout {
             progressTime.setVisibility(GONE);
         }
         albumBadge.setVisibility(GONE);
+        // 上一页的「封面淡出」动画可能还在跑：不复位的话它的 endAction 会把
+        // 刚绑上来的这一页封面设成 GONE，首帧出来前是一片黑
+        cover.animate().cancel();
         cover.setAlpha(1f);
         cover.setVisibility(VISIBLE);
         cover.setScaleType(ImageView.ScaleType.CENTER_CROP);
@@ -627,7 +659,7 @@ public final class FeedPage extends FrameLayout {
                 playing = false;
                 visualReady = false;
                 playAttempts = 0;
-                handler.removeCallbacks(visualFallback);
+                armVisualFallback();
                 errorText.setVisibility(GONE);
                 showLoading(true);
                 if (role == 0) {
@@ -636,6 +668,7 @@ public final class FeedPage extends FrameLayout {
             }
         } else if (work.isAlbum()) {
             showAlbumImage(albumIndex, false);
+            armVisualFallback();
             if (musicPlayer == null) {
                 prepareMusic();
             }
@@ -683,6 +716,13 @@ public final class FeedPage extends FrameLayout {
         if (favoriteLabel != null) {
             favoriteLabel.setText(favorite ? "已收藏" : "收藏");
             favoriteLabel.setTextColor(favorite ? 0xFFFFC53D : 0xF2FFFFFF);
+        }
+    }
+
+    /** 双击收藏时，在手指位置冒出心心；pager 传来的坐标就是整屏坐标，可直接用。 */
+    public void showFavoriteBurst(float x, float y) {
+        if (heartBurst != null) {
+            heartBurst.burst(x, y);
         }
     }
 
@@ -766,6 +806,14 @@ public final class FeedPage extends FrameLayout {
         }
         captionTokens.clear();
         captionRanges.clear();
+        if (text.isEmpty()) {
+            // 没文案就整行藏掉。以前这里会显示 `<作品id>.tar` 去掉扩展名后的一串数字，
+            // 那只是文件名，不是作品文案。
+            captionText.setText("");
+            captionText.setVisibility(GONE);
+            return;
+        }
+        captionText.setVisibility(VISIBLE);
         SpannableString spannable = new SpannableString(text);
         java.util.regex.Matcher matcher = TOKEN_PATTERN.matcher(text);
         while (matcher.find()) {
@@ -838,9 +886,8 @@ public final class FeedPage extends FrameLayout {
                 showError(message == null ? "作品读取失败" : message);
                 return;
             }
-            if (work.captionText != null && !work.captionText.isEmpty()) {
-                setCaption(work.captionText);
-            }
+            // 详情读完后统一刷新：有文案就显示，确实没有就保持隐藏
+            setCaption(work.captionLine());
             onDetailsReady();
         });
     }
@@ -860,15 +907,47 @@ public final class FeedPage extends FrameLayout {
     }
 
     private void prepareVideo() {
+        if (pageDestroyed) {
+            return;
+        }
         if (prepared || settingUp || player != null || work == null || work.video == null) {
+            return;
+        }
+        if (work.video.inArchive() && archiveVideo == null) {
+            // 作品包里只有 视频.mp4 这一个成员，按 Range 解出来再交给 MediaPlayer
+            if (!archiveVideoLoading) {
+                archiveVideoLoading = true;
+                showLoading(true);
+                final Work bound = work;
+                app.archives.file(work.video, (file, error) -> {
+                    archiveVideoLoading = false;
+                    if (pageDestroyed || work != bound) {
+                        return;
+                    }
+                    if (file == null) {
+                        showLoading(false);
+                        showError(error == null ? "作品包解包失败" : error);
+                        return;
+                    }
+                    archiveVideo = file;
+                    if (app.images != null) {
+                        app.images.cacheVideoCover(work, file);
+                    }
+                    prepareVideo();
+                });
+            }
             return;
         }
         settingUp = true;
         try {
-            java.io.File localVideo = app.offline.localVideo(work);
+            java.io.File localVideo = archiveVideo != null ? archiveVideo
+                    : app.offline.localVideo(work);
             String url = localVideo != null ? null
                     : app.proxy.urlFor(work.video.rel, work.video.name, work.video.size);
             MediaPlayer mp = new MediaPlayer();
+            // 先挂到字段：setDataSource / setSurface 抛异常时 catch 才释放得到这个播放器，
+            // 否则每次加载失败都会漏掉一个含 native 资源的 MediaPlayer。
+            player = mp;
             mp.setAudioStreamType(AudioManager.STREAM_MUSIC);
             mp.setLooping(false);
             mp.setVolume(muted ? 0f : 1f, muted ? 0f : 1f);
@@ -880,8 +959,7 @@ public final class FeedPage extends FrameLayout {
                 playAttempts = 0;
                 settingUp = false;
                 visualReady = false;
-                handler.removeCallbacks(visualFallback);
-                handler.postDelayed(visualFallback, 1500L);
+                armVisualFallback();
                 videoWidth = mediaPlayer.getVideoWidth();
                 videoHeight = mediaPlayer.getVideoHeight();
                 applyVideoTransform();
@@ -951,10 +1029,9 @@ public final class FeedPage extends FrameLayout {
             if (surface != null) {
                 mp.setSurface(surface);
             }
-            player = mp;
             mp.prepareAsync();
-            if (localVideo == null && app.prefs.autoNext()) {
-                // 预取下一屏的数据，滑过去就能直接播
+            if (localVideo == null && app.prefs.autoNext() && !work.video.inArchive()) {
+                // 预取下一屏的数据，滑过去就能直接播（作品包按成员解，不需要代理预取）
                 app.proxy.prefetch(work.video.rel, work.video.name, work.video.size);
             }
         } catch (Exception exc) {
@@ -982,15 +1059,38 @@ public final class FeedPage extends FrameLayout {
         cover.setBackgroundColor(Color.BLACK);
         showAlbumImage(0, false);
         scheduleAlbumTicker();
-        if (work.music == null && !work.musicChecked) {
-            app.scanner.loadMusic(work, () -> {
-                if (work == FeedPage.this.work) {
-                    prepareMusic();
-                }
-            });
-        } else {
-            prepareMusic();
+        // 图集首图读不出来（解包失败 / 网络抖动 / 解码失败）时，visualReady 永远不会置位，
+        // 已经 prepare 好的背景音乐就被一起卡死。随机观看的作品全是冷数据，
+        // 首图失败概率明显更高，这就是「随机看相册没声音」的主因。
+        armVisualFallback();
+        ensureMusic();
+    }
+
+    /** 画面迟迟不来时放行音乐：宁可先响，也不能让人一直等到退出重进。 */
+    private void armVisualFallback() {
+        if (visualReady) {
+            return;
         }
+        handler.removeCallbacks(visualFallback);
+        handler.postDelayed(visualFallback, 1500L);
+    }
+
+    /** 绑定一次只查一次独立音乐目录；作品包里的音乐来自成员清单，不用再查。 */
+    private void ensureMusic() {
+        if (work == null || musicLookupDone) {
+            return;
+        }
+        musicLookupDone = true;
+        final Work bound = work;
+        if (work.music != null) {
+            prepareMusic();
+            return;
+        }
+        app.scanner.loadMusic(work, () -> {
+            if (work == bound && !pageDestroyed) {
+                prepareMusic();
+            }
+        });
     }
 
     /** 音乐必须等画面（视频首帧 / 图集第一张）出来后再响，避免"音乐先响、画面还黑着"。 */
@@ -1011,32 +1111,85 @@ public final class FeedPage extends FrameLayout {
     }
 
     private void prepareMusic() {
-        if (work == null || work.music == null || musicPlayer != null) {
+        if (pageDestroyed) {
+            return;
+        }
+        if (work == null || work.music == null) {
             musicIcon.setVisibility(GONE);
             return;
         }
+        if (musicPlayer != null) {
+            // 播放器已经在跑（比如下载完成回调又调了一次）：别把音乐图标藏了
+            return;
+        }
+        final Work bound = work;
+        if (work.music.inArchive() && archiveMusic == null) {
+            if (!archiveMusicLoading) {
+                archiveMusicLoading = true;
+                app.archives.file(work.music, (file, error) -> {
+                    archiveMusicLoading = false;
+                    // 页面已经被复用到别的作品：这次解包结果作废，别把上一条的音乐
+                    // 挂到新作品上（以前写的是 work != FeedPage.this.work，两边是同一个
+                    // 字段，永远为 false，等于没有校验）。
+                    if (pageDestroyed || work != bound) {
+                        return;
+                    }
+                    if (file == null) {
+                        musicIcon.setVisibility(GONE);
+                        if (archiveMusicRetries < 2) {
+                            archiveMusicRetries++;
+                            handler.postDelayed(musicRetry, 1200L);
+                        }
+                        return;
+                    }
+                    archiveMusic = file;
+                    prepareMusic();
+                });
+            }
+            return;
+        }
         try {
-            java.io.File localMusic = app.offline.localMusic(work);
+            java.io.File localMusic = archiveMusic != null ? archiveMusic
+                    : app.offline.localMusic(work);
             String url = localMusic != null ? null
                     : app.proxy.urlFor(work.music.rel, work.music.name, work.music.size);
-            MediaPlayer mp = new MediaPlayer();
+            final MediaPlayer mp = new MediaPlayer();
             mp.setAudioStreamType(AudioManager.STREAM_MUSIC);
             mp.setLooping(true);
             mp.setVolume(muted ? 0f : 1f, muted ? 0f : 1f);
+            // 监听器要先挂上再 prepareAsync：否则失败时没人收错误，
+            // musicPlayer 一直非空、musicPrepared 一直 false，这条永远没声音也不会重试
+            mp.setOnPreparedListener(mediaPlayer -> {
+                if (mediaPlayer != musicPlayer) {
+                    return;
+                }
+                musicPrepared = true;
+                startMusicIfReady();
+            });
+            mp.setOnErrorListener((mediaPlayer, what, extra) -> {
+                if (mediaPlayer != musicPlayer) {
+                    return true;
+                }
+                releaseMusicPlayer();
+                if (!pageDestroyed && work != null && work.music != null
+                        && archiveMusicRetries < 2) {
+                    archiveMusicRetries++;
+                    handler.postDelayed(musicRetry, 1200L);
+                }
+                return true;
+            });
+            // 先挂到字段上：prepareAsync 的回调可能比方法返回还早
+            musicPlayer = mp;
             if (localMusic != null) {
                 mp.setDataSource(localMusic.getAbsolutePath());
             } else {
                 mp.setDataSource(getContext(), Uri.parse(url));
             }
             mp.prepareAsync();
-            mp.setOnPreparedListener(mediaPlayer -> {
-                musicPrepared = true;
-                startMusicIfReady();
-            });
-            musicPlayer = mp;
             musicIcon.setVisibility(VISIBLE);
             musicText.setText("背景音乐");
         } catch (Exception exc) {
+            releaseMusicPlayer();
             musicIcon.setVisibility(GONE);
         }
     }
@@ -1069,6 +1222,7 @@ public final class FeedPage extends FrameLayout {
                                 .setDuration(180).start()).start();
             }
             visualReady = true;
+            handler.removeCallbacks(visualFallback);
             startMusicIfReady();
         };
         java.io.File localImage = app.offline.localImage(work, index);
@@ -1081,6 +1235,23 @@ public final class FeedPage extends FrameLayout {
         albumBadge.setText("图集 " + (index + 1) + "/" + work.images.size());
         progressLine.setProgress((index + 1f) / work.images.size());
         updateProgressTime();
+        prefetchAlbumNeighbors(index);
+    }
+
+    /**
+     * 切完立刻把前后相邻图预解码进图集缓存：下一次划动就能同步命中、不必等
+     * WebDAV 整图下载 + 解码。只给当前屏预取，三屏里另两屏不浪费带宽。
+     */
+    private void prefetchAlbumNeighbors(int index) {
+        if (work == null || !work.isAlbum() || role != 0 || work.images.size() <= 1) {
+            return;
+        }
+        int width = Ui.screenWidth(getContext());
+        for (int neighbor : AlbumNav.neighbors(index, work.images.size())) {
+            RemoteFile file = work.images.get(neighbor);
+            java.io.File local = app.offline.localImage(work, neighbor);
+            images.prefetchImage(file, local, width);
+        }
     }
 
     private void scheduleAlbumTicker() {
@@ -1099,20 +1270,20 @@ public final class FeedPage extends FrameLayout {
                     || role != 0 || !hostResumed) {
                 return;
             }
-            showAlbumImage((albumIndex + 1) % work.images.size(), true);
+            showAlbumImage(AlbumNav.wrap(albumIndex + 1, work.images.size()), true);
             handler.postDelayed(this, ALBUM_INTERVAL);
         }
     };
 
     public void advanceAlbum() {
         if (work != null && work.isAlbum() && !work.images.isEmpty()) {
-            showAlbumImage((albumIndex + 1) % work.images.size(), true);
+            showAlbumImage(AlbumNav.wrap(albumIndex + 1, work.images.size()), true);
         }
     }
 
     public void previousAlbum() {
         if (work != null && work.isAlbum() && !work.images.isEmpty()) {
-            showAlbumImage((albumIndex - 1 + work.images.size()) % work.images.size(), true);
+            showAlbumImage(AlbumNav.wrap(albumIndex - 1, work.images.size()), true);
         }
     }
 
@@ -1513,28 +1684,42 @@ public final class FeedPage extends FrameLayout {
             return;
         }
         if (work == null || timePill.getVisibility() == VISIBLE) {
-            progressTime.setVisibility(GONE);
+            setProgressTimeVisible(false);
             return;
         }
+        String text;
         if (work.isAlbum()) {
             int total = work.images.size();
             if (total <= 0) {
-                progressTime.setVisibility(GONE);
+                setProgressTimeVisible(false);
                 return;
             }
             int current = Math.min(total, albumIndex + 1);
-            progressTime.setText("第 " + current + " 张 / 共 " + total + " 张");
-            progressTime.setVisibility(VISIBLE);
+            text = "第 " + current + " 张 / 共 " + total + " 张";
+        } else {
+            long duration = durationMs();
+            if (duration <= 0) {
+                setProgressTimeVisible(false);
+                return;
+            }
+            text = Util.formatDuration(positionMs()) + " / " + Util.formatDuration(duration);
+        }
+        // ticker 每 220ms 调一次：文字没变就别 setText，否则每次都 requestLayout，
+        // 三块全屏页面跟着重新测量，图集页更是白忙。
+        if (!text.contentEquals(progressTime.getText())) {
+            progressTime.setText(text);
+        }
+        setProgressTimeVisible(true);
+    }
+
+    private void setProgressTimeVisible(boolean visible) {
+        if (progressTime == null) {
             return;
         }
-        long duration = durationMs();
-        if (duration <= 0) {
-            progressTime.setVisibility(GONE);
-            return;
+        int target = visible ? VISIBLE : GONE;
+        if (progressTime.getVisibility() != target) {
+            progressTime.setVisibility(target);
         }
-        progressTime.setText(Util.formatDuration(positionMs()) + " / "
-                + Util.formatDuration(duration));
-        progressTime.setVisibility(VISIBLE);
     }
 
     public void seekTo(long millis) {
@@ -1576,20 +1761,23 @@ public final class FeedPage extends FrameLayout {
         if (isInside(backIcon, x, y, 26)) {
             return HIT_BACK;
         }
-        if (isInside(muteIcon, x, y, 26)) {
+        // 静音和下载两个图标中心只隔 42dp，命中区外扩超过 10dp 就会互相抢点击
+        if (isInside(muteIcon, x, y, 10)) {
             return HIT_MUTE;
         }
-        if (isInside(downloadIcon, x, y, 26)) {
+        if (isInside(downloadIcon, x, y, 10)) {
             return HIT_DOWNLOAD;
         }
-        if (isInside(commentIcon, x, y, 26)) {
-            return HIT_COMMENT;
+        // 命中区外扩 26dp 后相邻按钮会重叠，判定顺序必须和侧栏自上而下的顺序一致，
+        // 否则点在两个按钮中间会落到下面那个按钮上
+        if (isInside(favoriteIcon, x, y, 26)) {
+            return HIT_FAVORITE;
         }
         if (isInside(shareIcon, x, y, 26)) {
             return HIT_SHARE;
         }
-        if (isInside(favoriteIcon, x, y, 26)) {
-            return HIT_FAVORITE;
+        if (isInside(detailIcon, x, y, 26)) {
+            return HIT_DETAIL;
         }
         if (isInside(autoIcon, x, y, 26)) {
             return HIT_AUTO_DOWNLOAD;
@@ -1602,9 +1790,11 @@ public final class FeedPage extends FrameLayout {
 
     /** 进度条的可触摸范围（已整体上移，避开系统底部手势）。 */
     public boolean isInProgressTouchZone(float y) {
+        // 只留 26dp 窄带：原来往上一路吃到 34dp，会把「背景音乐」那一行也框进来，
+        // 点音乐行下半截会莫名其妙跳进度。
         return progressLine.getVisibility() == VISIBLE
-                && y > progressLine.getTop() - Ui.dp(getContext(), 34)
-                && y < progressLine.getTop() + Ui.dp(getContext(), 12);
+                && y > progressLine.getTop() - Ui.dp(getContext(), 16)
+                && y < progressLine.getTop() + Ui.dp(getContext(), 10);
     }
 
     private boolean isInside(View view, float x, float y, int paddingDp) {
@@ -1629,6 +1819,7 @@ public final class FeedPage extends FrameLayout {
     // ---------- 释放 ----------
     public void releasePlayers() {
         handler.removeCallbacks(albumTicker);
+        handler.removeCallbacks(musicRetry);
         if (player != null) {
             try {
                 player.stop();
@@ -1641,15 +1832,7 @@ public final class FeedPage extends FrameLayout {
             player = null;
         }
         if (musicPlayer != null) {
-            try {
-                musicPlayer.stop();
-            } catch (Exception ignored) {
-            }
-            try {
-                musicPlayer.release();
-            } catch (Exception ignored) {
-            }
-            musicPlayer = null;
+            releaseMusicPlayer();
         }
         prepared = false;
         playing = false;
@@ -1664,8 +1847,25 @@ public final class FeedPage extends FrameLayout {
     }
 
     public void destroy() {
+        pageDestroyed = true;
         releasePlayers();
         handler.removeCallbacksAndMessages(null);
+    }
+
+    /** 只释放背景音乐（视频播放器不动）：音乐出错时释放掉，下次 bind 还能重新试。 */
+    private void releaseMusicPlayer() {
+        if (musicPlayer != null) {
+            try {
+                musicPlayer.stop();
+            } catch (Exception ignored) {
+            }
+            try {
+                musicPlayer.release();
+            } catch (Exception ignored) {
+            }
+            musicPlayer = null;
+        }
+        musicPrepared = false;
     }
 
     public boolean isPlaying() {

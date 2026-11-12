@@ -5,6 +5,8 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.Outline;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
@@ -34,6 +36,21 @@ public final class FavoriteActivity extends Activity {
     private TextView emptyText;
     private int cellWidth;
     private int cellHeight;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    /** 冷启动时片库索引还在后台读，等它读完再对收藏，别先报「还没有收藏」。 */
+    private final Runnable loadWatcher = new Runnable() {
+        @Override
+        public void run() {
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
+            if (app.store.isLoaded()) {
+                reload();
+            } else {
+                handler.postDelayed(this, 150L);
+            }
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -51,6 +68,13 @@ public final class FavoriteActivity extends Activity {
         super.onResume();
         // 播放页里可能刚收藏/取消收藏，每次回来都重新对一遍
         reload();
+    }
+
+    @Override
+    protected void onDestroy() {
+        handler.removeCallbacks(loadWatcher);
+        handler.removeCallbacksAndMessages(null);
+        super.onDestroy();
     }
 
     private void buildUi() {
@@ -103,6 +127,18 @@ public final class FavoriteActivity extends Activity {
     }
 
     private void reload() {
+        if (!app.store.isLoaded()) {
+            // 索引没读完时 find() 全是 null，直接显示「还没有收藏」会误导人
+            works.clear();
+            countText.setText("");
+            emptyText.setText("正在读取本地片库…");
+            emptyText.setVisibility(View.VISIBLE);
+            list.setVisibility(View.GONE);
+            handler.removeCallbacks(loadWatcher);
+            handler.postDelayed(loadWatcher, 150L);
+            return;
+        }
+        handler.removeCallbacks(loadWatcher);
         works.clear();
         for (String rel : app.favorites.rels()) {
             Work work = app.store.find(rel);

@@ -45,6 +45,11 @@ public final class FeedSession {
         return index;
     }
 
+    /** 播放页翻页后回写：Activity 被系统重建时不会又跳回「刚打开那一条」。 */
+    public static void setIndex(int value) {
+        index = Math.max(0, Math.min(value, Math.max(0, items.size() - 1)));
+    }
+
     public static String label() {
         return label;
     }

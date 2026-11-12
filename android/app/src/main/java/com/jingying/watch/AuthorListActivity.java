@@ -6,6 +6,8 @@ import android.graphics.Color;
 import android.graphics.Outline;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.Gravity;
@@ -38,6 +40,13 @@ public final class AuthorListActivity extends Activity {
     private Adapter adapter;
     private EditText search;
     private TextView countText;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    /** 搜索防抖：作者上千位时，每敲一个字都重算一遍列表没必要。 */
+    private final Runnable searchRunnable = () -> {
+        if (search != null) {
+            applyFilter(search.getText().toString());
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -51,6 +60,13 @@ public final class AuthorListActivity extends Activity {
         super.onResume();
         // 每次回到列表都重新读一遍：作者主页里删掉作者后要能立刻消失
         reload();
+    }
+
+    @Override
+    protected void onDestroy() {
+        handler.removeCallbacks(searchRunnable);
+        handler.removeCallbacksAndMessages(null);
+        super.onDestroy();
     }
 
     private void reload() {
@@ -133,7 +149,8 @@ public final class AuthorListActivity extends Activity {
 
             @Override
             public void onTextChanged(CharSequence s, int start, int before, int count) {
-                applyFilter(s == null ? "" : s.toString());
+                handler.removeCallbacks(searchRunnable);
+                handler.postDelayed(searchRunnable, 200L);
             }
 
             @Override
@@ -191,15 +208,20 @@ public final class AuthorListActivity extends Activity {
                 holder = (Holder) convertView.getTag();
             }
             Library.AuthorInfo info = getItem(position);
+            if (!info.name.equals(holder.author)) {
+                // 复用到别的作者：头像先清掉，别让上一个作者的脸留在这一行
+                holder.avatar.setImageDrawable(null);
+                holder.loadedAuthor = null;
+            }
             holder.author = info.name;
             holder.name.setText(info.name);
             String sub = (info.uid.isEmpty() ? "" : info.uid + " · ")
                     + info.count + " 个作品";
             holder.sub.setText(sub);
             holder.letter.setText(AvatarStore.initialOf(info.name));
-            holder.avatar.setImageDrawable(null);
             Work sample = samples.get(info.name);
-            if (sample != null) {
+            if (sample != null && !info.name.equals(holder.loadedAuthor)) {
+                holder.loadedAuthor = info.name;
                 final String author = info.name;
                 app.avatars.load(sample, (name, uid, bitmap) -> {
                     if (bitmap != null && author.equals(holder.author)) {
@@ -219,6 +241,8 @@ public final class AuthorListActivity extends Activity {
         TextView name;
         TextView sub;
         String author = "";
+        /** 这一行已经为哪个作者发过头像请求：同一个作者滚回来时不用再发一次。 */
+        String loadedAuthor;
 
         View build() {
             root = new LinearLayout(AuthorListActivity.this);

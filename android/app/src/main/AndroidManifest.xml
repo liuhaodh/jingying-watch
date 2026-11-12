@@ -4,7 +4,6 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- Android 11+ 包可见性：要显式拉起抖音，先声明能看到它 -->
     <queries>
@@ -21,6 +20,14 @@
         android:supportsRtl="true"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="true">
+
+        <!-- 分享作品 tar：自实现的只读 provider（项目没有 androidx FileProvider）。
+             exported=false + 临时 URI 授权，接收方只能在 ACTION_SEND 里读这一个文件。 -->
+        <provider
+            android:name=".ShareProvider"
+            android:authorities="com.jingying.watch.share"
+            android:exported="false"
+            android:grantUriPermissions="true" />
 
         <activity
             android:name=".HomeActivity"

@@ -1177,3 +1177,538 @@ aapt2 解包确认 manifest 里已包含 `com.ss.android.ugc.aweme` 的 `<querie
 
 > 说明：本轮仍无真机回归。装机后打开任意作品，文案下方应显示
 > 「发布时间 … · xx MB」；刚滑到还没读完详情的作品时先只有时间，读完后补上大小。
+
+---
+
+## 第三十三轮：性能与健壮性集中优化（2026-11-07 晚）
+需求：优化整个项目。做法不是加功能，而是把代码全量审计了一遍（媒体链路、播放页、
+封面/下载/收藏、扫描与列表四个方向），挑「用户能感知 + 风险可控」的问题修。
+
+### 数据正确性
+- **重新扫描不再丢作品详情**：扫描器只拿得到骨架，`LibraryStore.addBatch()` 以前直接
+  覆盖同名作品，于是「某位作者目录里新增一条视频 → 父目录 mtime 变了 → 该作者整批重扫」
+  之后，这位作者所有作品的封面/图集类型/文案/音乐全被冲掉。现在骨架会并进已有对象
+  （`Work.mergeSkeleton()`），只更新作者/目录名/时间/mtime。
+- **扫描裁剪加保护**：以前只要 `all` 非空就 `retain(rels)`，某个作者目录这次读成空的
+  （服务端同步中/限流/网络抖动）就会把这位作者的作品从 `library.json` 永久删掉。
+  现在只有「每个作者都读成功」的一轮才裁剪；某个以前有作品的作者这次读成空目录时，
+  沿用本地缓存并标记失败，本轮不裁剪。
+- **占位图不再永久落盘**：封面生成失败时画出来的渐变占位图以前会写进
+  `files/covers/<key>.jpg`，下次直接命中，网络恢复后片库也一直停在假封面上。
+  现在占位图只放内存；换连接（`App.reloadDav()`）时把「只画了占位图」的 key 忘掉重试。
+- **「重新扫描作者资料」真的会联网**：以前 `refresh()` 清空内存映射但没删本地
+  `authors.json`，`ensureIndex()` 读到旧文件就跳过联网分支，等于什么都没做。现在先删缓存文件。
+- **头像索引不再把主线程卡死**：`ensureIndex()` 以前整段持锁联网（最长 40 秒），
+  主线程上的 `cachedSecUid()` 会跟着等 → 点「打开抖音主页」直接 ANR。
+  现在联网在锁外，等锁最多 5 秒；失败退避 60 秒；成功/失败都写清状态。
+- **本地下载**：`meta.json` 改成「先写 .tmp 再改名」，掉电不会留下半截 JSON
+  （旧逻辑启动时会把这种目录整个删掉）；进度分母不再算实况图（`lives` 本来就不下载，
+  以前百分比永远到不了 100）；下载途中删除作品会标记取消，收尾时不再把记录写回索引。
+- **回收站**：`MOVE` 失败后回滚自己也失败时，不再 `deleteTree`（那会把用户目录真删掉），
+  改为报错让人工处理；恢复中途失败会把已经搬回去的部分搬回回收站，避免
+  「一半在外面、一半在里面」导致以后永远恢复不了。
+- **收藏页**：片库索引还没读完时显示「正在读取本地片库…」并等待，不再误报「还没有收藏」。
+
+### 性能 / 卡顿
+- **首页**：搜索改成停手 220ms 再筛；扫描期间冻结作者 chips 和全量统计（结束统一重建一次）；
+  用 `LibraryStore.revision()` 判断是否需要重读（以前比数量，删一条补一条就漏刷新）；
+  「已下载/下载中」徽标底色改成 `Cell` 构造时建一次，滚动不再每次 `new GradientDrawable`。
+- **首页接管进行中的扫描**：扫描是全局的，退出重进/从别的页面起扫描时，新首页以前
+  只会 toast「正在扫描」然后永远收不到完成回调；现在挂上去轮询，结束后重读落盘结果。
+  停止扫描时也不再展示「只存在于内存、点开 404」的增量。
+- **随机观看**：跳过空作品；「只看某作者 / 只看已下载 / 搜索中」时在当前列表里随机。
+- **作者列表**：搜索防抖 200ms；同一行滚动回来不再重复请求头像。
+- **播放页手势**：去掉「单击暂停要等 260ms 判断双击」的延迟（双击功能早就没接，纯白等）；
+  手指按下时给吸附动画收尾（不再在手指下面跳页）；长按和进度条拖动不再打架，
+  抬手时先处理 scrub；进度条热区从 46dp 收到 26dp，不再吃掉「背景音乐」那一行；
+  静音/下载两个图标的命中区从 ±26dp 收到 ±10dp（原来点下载图标左侧会静音）；
+  多指抬起不再可能凭空翻一页。
+- **播放页其它**：ticker 每 220ms 只在文字真的变了才 `setText`（避免整棵三屏 relayout），
+  退到后台立刻停掉；绑定新作品时取消上一条的封面淡出动画（否则新页面首帧前一片黑）；
+  复用页面时 `spinner.stop()`；图集背景音乐先挂 `OnErrorListener` 再 `prepareAsync`，
+  失败会释放、下次可重试；静音时不再一直占着音频焦点（以前会把后台播客掐掉）；
+  `#话题` 过滤改用带缓存的 `Work.searchText()`。
+- **媒体代理**：失败不再粘滞（3 秒退避后允许重新拉，最多连续 5 次），pump 内部重试
+  真正生效；`handle()` 里网络探测的 `size` 改为在锁内、只在 `entry.size<=0` 时写入，
+  不再把下完的文件改小标成「完整但截断」；本地 socket 请求头改 `BufferedInputStream`；
+  每拿到一段数据就 `flush`，几 KB 的小片段不会被 64KB 缓冲攒住；`accept()` 失败加日志和
+  200ms 退避（不再 100% CPU 空转）；`clearCache()` 的目录删除移到 maintenance 线程
+  （最多 8GB，以前在主线程递归删）；清缓存期间对外报 0。
+- **封面/下载索引**：`clearDisk()` 不再在主线程删一万多个文件，并让在途任务别回写；
+  `OfflineStore.load()` 不再在 `has()`（列表 bind 里）同步扫目录解析 meta，改成后台建索引
+  完成后 `notifyChanged(null)` 刷新。
+- **头像**：磁盘解码的 `inSampleSize` 与首次下载统一（以前重启后头像会糊一半）；
+  找不到头像的作者记 10 分钟负缓存，不再让唯一一条头像线程反复堵在 404 上。
+- **详情只读一次**：同一个作品被「封面生成」「下载」「播放页绑定」同时请求时，以前会各打一次
+  PROPFIND；现在 `LibraryScanner.loadDetails()` 把后来的请求挂到同一份结果上。
+- **封面磁盘上限**：`files/covers` 以前只增不减（一万多个作品看一遍就是几百 MB），
+  现在超过 8000 张按 `lastModified` 清到 6000 张（后台 io 线程做）。
+- **下载前检查空间**：`getUsableSpace()` 不够 `1.15 ×` 作品体积时直接报「手机剩余空间不足」，
+  不再先下到一半再把 `.part` 删掉重试三次。
+
+### 工程
+- 新增纯 Java 单元测试 `tools\test\com\jingying\watch\WatchTests.java` +
+  `tools\run-tests.ps1`（只编译不依赖 Android 的类，配合 `tools\json.jar`），
+  覆盖目录名解析、文件分类、落盘往返、骨架合并、筛选排序、统计、打乱、抖音链接、格式化。
+- `build.ps1` 新增 `-Test`：打包前先跑单元测试，失败直接中止。
+- 去掉没用到的 `WAKE_LOCK` 权限（全工程只有 `FLAG_KEEP_SCREEN_ON`）。
+
+### 验证
+```text
+tools\run-tests.ps1
+PASS 113 / FAIL 0
+```
+`android\build.ps1 -Test` 全流程通过（aapt2 → javac → d8 → zipalign → apksigner），
+产物 `JingYing-Watch-latest.apk`（v1.0.6，versionCode=16，约 0.17 MB）；
+`aapt2 dump badging` 确认权限只剩 `INTERNET` / `ACCESS_NETWORK_STATE`。
+
+> 说明：本轮仍**没有真机回归**。装机理应看到的变化：
+> ① 添加作品后重扫，旧作品的封面不再集体变占位图；
+> ② 单击暂停立即生效；按住进度条不再触发 2×，也不再吞掉 seek；
+> ③ 静音刷视频时后台音乐不会被掐；
+> ④ 冷启动进首页/收藏页不再卡一下，收藏页不会先闪「还没有收藏」；
+> ⑤ 网络抖动一次后，同一个视频仍能重试播放。
+---
+
+## 第三十四轮：云端作品包（tar）按需解包（2026-11-08 下午）
+需求：「电脑版」改成每个作品一个 `<作品id>.tar` 后，观看端要能从 WebDAV 直接读这个包，
+播放/看图时再解包，而不是只认散目录。
+
+### 实现
+- 新增 `TarReader`：自己解析 tar 头（USTAR / PAX 扩展头 / GNU 长文件名，支持中文），
+  只依赖 `java.*`，可以直接在桌面 JVM 单测。
+- 新增 `DavTarSource`：按 Range 从 WebDAV 的 tar 里读一段/一个成员。列成员只读
+  512 字节头并跳过数据块，不下载视频本体；播放时只解「视频.mp4」这一个成员。
+- 新增 `ArchiveStore`：成员解到 `files/archive/<包路径哈希>/`，同一个包复用；
+  解包缓存 2GB，超过按最后访问清理；离线下载过的作品优先用本地 tar 解包，
+  不再走网络。服务器不支持 Range 时退回「整包下到 `files/archive/full` 再解」。
+- `RemoteFile` 增加 `archiveRel` + `offset`：包内成员也能走原来的播放/看图链路，
+  `inArchive()` 判断要不要先解包；`Work` 增加 `archive`、`archiveSkeleton()`、
+  `fromArchive()`、`mergeArchiveDetails()`，并落盘/恢复这些字段。
+- 扫描：作者目录下的 `.tar` 文件也当作品（标题先用作品 id，打开后读包内文案补全）；
+  详情只读 tar 头和包里的 `文案.txt`，播放时才解视频；图集按需解图片/音乐。
+- 播放页：视频/音乐成员异步解包后交给 `MediaPlayer`；图集通过 `ImageLoader` 解包解码；
+  视频播成功后用解出来的本机文件生成首帧封面，首页下次绑定就能看到真封面。
+- 离线下载：作品包整个下到本地（进度按 tar 体积），播放时从本地 tar 解包。
+- 回收站：单个作品的 tar 文件按文件 `MOVE`/恢复；回收站里点 tar 条目可以按 tar 头预览；
+  恢复后按 `archiveSkeleton` 加回片库。
+- 设置页新增「清空解包缓存（作品包）」，缓存统计里显示解包占用。
+
+### 测试中修掉的三个问题
+1. `TrashStore.loadWork` 用 `item.type == "work"` 比较字符串引用，导致 tar 预览永远
+   走旧分支、报「回收站里找不到可播放的文件」；改成 `"work".equals(...)`。
+2. `TrashActivity.afterRestore` 恢复作品时一律建散目录骨架，tar 作品恢复后打不开；
+   改成 `.tar` 用 `Work.archiveSkeleton(...)`。
+3. `Work.mergeSkeleton` 会用骨架的 tar mtime 覆盖已经解析出来的发布时间；
+   现在「已读详情 + 有文案」时保留文案里的发布时间。
+
+### 验证
+- 单元测试：`tools\run-tests.ps1` → **PASS 141 / FAIL 0**（新增 tar 打包/PAX/解包/
+  坏包 11 项、tar 作品模型与落盘 16 项）。
+- 模拟器（Android 15 x86_64）+ 本地 Java mock WebDAV（Range/PROPFIND/MOVE/DELETE）：
+  - 两个 tar 作品被扫描出来（`作品 2 · 作者 1`，角标「作品」）；
+  - 视频 tar：详情读出 `周末露营测试作品 / 2026-11-08 10:10 / 8.8 MB`，
+    解出 `视频.mp4` 7,472,760 字节后正常播放（`00:03 / 00:11`）；
+  - 图集 tar：`图集 2/2`、`第 2 张 / 共 2 张`，两张图分别解到
+    `图片_01.jpg` / `图片_02.jpg`，背景音乐成员也解到 `音乐.mp3`；
+  - 首页回绑后标题变成文案标题、角标变成「视频 / 图集 2」，封面缓存里出现
+    两张 `w*.jpg`（视频首帧 + 图集首图）；
+  - 下载：`files/offline/<key>/<作品id>.tar`（9,245,184 字节）+ `meta.json`；
+    停掉 mock 服务、清空解包缓存后重开，仍能从本地 tar 解出视频播放；
+  - 回收站：删除后云端出现 `回收站/<id>.tar__时间/data`（tar 本体）与 `meta.txt`，
+    首页少一条；回收站里点条目能直接预览播放；恢复后 tar 回到原作者目录、列表恢复。
+- `android\build.ps1 -Test` 全流程通过；产物 `JingYing-Watch-latest.apk`
+  （v1.0.8，versionCode=18，约 0.18 MB），`aapt2 dump badging` 确认没有 debuggable 标记。
+
+> 说明：mock 测试用的是本机 tar.exe 打的 PAX 包；电脑版 Python tarfile 的 PAX 头
+> 已在 `TarReader` 里按「字节长度」解析，并有单测覆盖。旧版散目录作品未回归。
+---
+
+## 第三十五轮：播放时预热后面 10 个作品（2026-11-08 下午）
+需求：播放时提前加载后面十个作品，滑过去不用等。
+
+### 改动
+- `FeedActivity.prefetchAhead()` 从「后面 2 条」扩到「后面 10 条」：
+  - 详情没读过的先读详情（含 tar 作品的包信息）；
+  - 详情就绪后，普通视频调用 `MediaProxy.prefetchPrefix(..., 2MB)` 预取开头 2MB；
+  - tar 作品只预载详情（视频要先整段解包，预热整段代价太大），切到该条时再解。
+- `MediaProxy` 新增「只预取一段」：
+  - `Entry.prefetchLimit` / `prefetchedPrefix`；
+  - `downloadOnce()` 到达上限就正常停住，不当作「连接提前结束」；
+  - `awaitAvailable()` 在播放追上预热段时清掉上限，pump 从 `firstGap` 继续续传；
+  - 每个作品只预热一次，翻页重复调用不会反复下载。
+- 进入播放页时补调一次 `prefetchAhead()`（`setItems` 不保证触发 `onPageChanged`）；
+  回收站预览不预热。
+
+### 验证
+- `android\build.ps1 -Test`：**PASS 141 / FAIL 0**，打包含 `prefetchPrefix`。
+- 产物 `JingYing-Watch-latest.apk`（v1.0.9，versionCode=19）。
+- 说明：本轮只做了构建 + 单测；模拟器上的 tar 联调是上一轮（同一套 1.0.7 构建），
+  prefetchPrefix 的 Range 续传逻辑已按 `MediaProxy` 现有 pump/seek 语义静态核对，
+  未在真机上单独量过 10 条预热的耗时。
+---
+
+## 第三十六轮：屏幕可见的 tar 作品自动生成封面（2026-11-08 下午）
+需求：手机屏幕能显示的作品都要解包/读取一下，把作品封面显示出来。
+
+### 改动
+- `ImageLoader.generate()` 对 archive 作品不再直接返回占位图：
+  - 先按需读 tar 详情（`ensureDetails`）；
+  - 图集：`ArchiveStore` 解出首图后解码；
+  - 视频：新增 `TarMediaDataSource`（`android.media.MediaDataSource`），把 tar 里的
+    `视频.mp4` 成员伪装成普通媒体文件交给 `MediaMetadataRetriever` 取首帧。
+    只读 `readAt` 真正要的几段（256KB 分块缓存），不整段解包；
+  - 个别机型/不支持 Range 的服务器取帧失败时，≤20MB 的视频退回 `ArchiveStore`
+    整段解包再取帧，更大的先占位、播放成功后再补封面。
+- 首页/作者页/收藏页的 `loadCover()` 都走同一条路径，所以「屏幕上看得到的格子」
+  会自动出封面；没绑定的作品不会主动解包（避免整库下载）。
+- 作品封面生成后照常进内存 LRU + `covers/*.jpg` 磁盘缓存，下次启动直接用。
+
+### 验证
+- 模拟器（Android 15 x86_64）+ 本地 Java mock WebDAV（只读 PROPFIND/Range）：
+  放一个 7.1MB 视频的 tar；先在设置页清空「封面缓存 + 解包缓存」，
+  返回首页等待后，设置页显示 **封面 78.8 KB、解包 0 B** —— 证明视频封面是用
+  MediaDataSource 按 Range 读出来的，没有把视频整段解到 `files/archive`。
+- `android\build.ps1 -Test`：**PASS 141 / FAIL 0**。
+- 产物 `JingYing-Watch-latest.apk`（v1.0.10，versionCode=20）。
+- 说明：只验证了视频 tar 的封面；图集封面沿用上一轮「解首图」路径。
+---
+
+## 第三十七轮：修复「作品没点开不显示封面」（2026-11-08 傍晚）
+反馈：上一轮的封面自动加载在部分手机上仍然要点开作品才出封面。
+
+### 原因
+1. 上一轮视频封面优先走 `MediaDataSource` 取帧；个别机型/服务器不支持或取帧失败，
+   只对 ≤20MB 的视频兜底解包，更大的视频就一直停在占位图。
+2. 失败生成的占位图被放进了内存 LRU，首页 `peek()` 之后直接命中占位图，
+   不再调用 `loadCover()`，所以即使详情/网络已经恢复也不会重试，只有点开作品
+   播放成功后才用 `cacheVideoCover()` 换掉。
+
+### 修复
+- 视频封面改成「解包优先」：≤80MB 的 `视频.mp4` 直接解到本地再取首帧
+  （和播放共用 `files/archive` 缓存，点开时秒开）；>80MB 才先用 MediaDataSource
+  按 Range 取帧，失败再退回解包，不再有「20MB 以下才兜底」的限制。
+- `ImageLoader` 给失败占位图加 20 秒退避：`peek()` 不再直接返回失败占位图，
+  `loadCover()` 在退避结束后清掉内存占位并重新取封面；成功/下载/播放补封面时
+  同步清掉失败标记。
+- 这样「屏幕可见作品 → 自动读详情 → 解包/取帧 → 真封面」不再依赖点开播放。
+
+### 验证
+- 模拟器（Android 15 x86_64）+ 本地 mock WebDAV，一个 7.1MB 视频的 tar：
+  设置页清空「封面缓存 + 解包缓存」→ 返回首页等待 → 再进设置页：
+  **封面 78.8 KB、解包 7.1 MB**（视频已解出用于取帧），封面不再依赖打开播放。
+- `android\build.ps1 -Test`：**PASS 141 / FAIL 0**。
+- 产物 `JingYing-Watch-latest.apk`（v1.0.11，versionCode=21）。
+- 说明：可见作品越多、视频越大，首屏会解出越多视频；这是「不点开也显示真实封面」
+  的代价，缓存仍按 2GB LRU 清理。
+---
+
+## 第三十八轮：封面 / 首页 / 媒体缓存的流畅度优化（2026-11-11 上午）
+需求：再做一轮「性能与流畅度」优化，只动用户能感知的主线程卡顿，以及大库、长会话下的
+资源占用；不新增功能，不改目录协议。
+
+### 封面：不再为了等详情把线程卡住
+- `ImageLoader` 以前在生成 tar/散目录作品的封面时，用 `CountDownLatch.await(25s)` 等详情。
+  封面线程池只有 3 条，首页快速滚动遇到几个 tar 作品，后面的格子就要排几十秒。
+- 现在需要详情时直接挂在 `LibraryScanner.loadDetails()` 的回调上，任务先返回；
+  详情回来后自动重跑这一张封面（`waitingDetails` 去重，详情失败就按失败画占位）。
+  封面线程只做解码/取帧，不再被网络等待占住。
+- 封面落盘从「先压进 `ByteArrayOutputStream` 再 `toByteArray()`」改成直接压到
+  `FileOutputStream`，滚动时少一次几十 KB 的临时数组。
+
+### 首页：作者 chips 和大列表
+- 作者列表按 `LibraryStore.revision()` 缓存，搜索时不再每次都 `Library.authors(allWorks)`
+  （遍历 + 排序全库）。
+- 筛选变化时只改「选中/未选中」两颗 chip 的颜色，不再 `removeAllViews()` 重建整排；
+  `ChipTag` 记录状态，只有真的变了才新建 drawable。
+- chip 改成**分批挂载**：首屏挂 40 个，横向滚到接近末尾再追加 40 个。
+  ListView 的表头每次布局都会重新 measure 所有子 view，作者上千位时这是滚动掉帧的大头。
+- 「已下载 N」单独缓存：下载完成只改这一个 chip 的文案，不重建 chips（滚动位置不会跳回最左）。
+- 搜索时不再对已排好序的列表重复排序：`Library.filter()` 新增 `sort` 参数，
+  首页在 `worksSorted` 时传 `false`；扫描增量追加期间仍会排序。
+
+### 媒体缓存 / 预热
+- 预热后面 10 个作品的任务改到单独的 `prefetchPool`（1 条线程），
+  播放器拖动进度条后的续传不会再排在 10 个 2MB 预热任务后面干等。
+- `cacheBytes()` 结果缓存 15 秒：首页 resume、设置页、统计刷新不再每次递归 stat
+  整个缓存目录（最多 8GB）；清缓存 / 删除 / 启动清扫后失效。
+- `trimAsync()` 节流 15 秒（改缓存上限时强制立即执行），不会每下完一个文件就扫一遍目录。
+- `entries` 超过 3000 条时，把 2 分钟没访问、没有读者、没有在下载的条目从内存摘掉
+  （只丢 Entry，不删缓存文件，下次按 `.ok` 直接复用）。
+
+### 头像
+- `AvatarStore` 的内存缓存原来是无上限 `ConcurrentHashMap`，片库几千位作者全看过一遍
+  就一直占着内存；改成 8MB 的 `LruCache`（按 `getByteCount()` 计），
+  失败负缓存也加了 4096 条上限。
+
+### 验证
+- `tools\run-tests.ps1`：**PASS 143 / FAIL 0**（新增 2 项：`filter(sort=false)` 保持输入顺序、
+  `sort=true` 会给乱序输入排序）。
+- `android\build.ps1 -Test` 全流程通过，产物 v1.0.19。
+- 桌面 JVM 基准（只为比较相对成本，绝对值不代表手机）：
+  - 18 MB / 1.6 万作品的 `library.json`：`new JSONObject(String)` ≈ 420ms，
+    流式 `JSONTokener(Reader)` ≈ 610ms → **保留整串解析**，不做流式改造；
+  - 完整读库（解析 + `Work.fromJson` × 16000 + 排序）≈ 560ms（JIT 预热后）。
+
+> 说明：本轮没有真机回归（当前环境的 adb 起不来，模拟器连不上）。
+> 装机理应看到：① 首页快速滚动时封面不再排队几十秒；② 作者很多时横向 chips
+> 滚动更顺、搜索不再卡一下；③ 拖动进度条时后面的 10 个预热不再抢在续传前面；
+> ④ 长时间浏览后内存不再随作者数/作品数持续上涨。
+
+---
+
+## 第三十九轮：随机观看图集没有背景音乐（2026-11-11 晚）
+反馈：点首页「随机观看」，刷到图集作品时没有背景音乐；从首页点同一个作品进去却有。
+
+### 原因
+1. **主因：音乐被「画面就绪」永久卡住。**
+   `startMusicIfReady()` 要求 `visualReady`。视频页在 `onPrepared` 里挂了 1.5 秒的
+   `visualFallback`，画面出不来也会放行音乐；**图集页从来没挂这个兜底**：
+   `visualReady` 只在 `showAlbumImage()` 的回调里、且 `albumIndex == target` 时置位。
+   随机观看的候选几乎全是没读过详情的冷数据，一进播放页就要并发做
+   「10 个作品预热详情 + 3 屏封面 + 首图解包」，首图很容易超过 3.2 秒轮播间隔；
+   轮播一推进 `albumIndex`，先到的那张图回调就被判为过期 → `visualReady` 永远 false
+   → 音乐播放器明明 `prepare` 好了也永远不会 `start()`。
+   从首页点开时封面/详情多半已经缓存，首图能及时回来，所以听起来「只有随机会坏」。
+2. **一次查询失败被永久记成「没有音乐」。** `loadMusicSync()` 无论 PROPFIND 成功还是
+   抛异常，最后都写 `work.musicChecked = true`；`app.store.update(work)` 还会落盘。
+   随机观看并发高，偶发 404/限流就会把这个作品钉成「无音乐」，之后连重试都没有。
+3. **音乐查询排在预热后面。** `loadMusic()` 和 `prefetchAhead()` 的 10 个 `loadDetails`
+   共用 `app.details`（3 条线程），当前图集的音乐查询要排队，滑得快就等于没声音。
+4. **解包回调串页。** `prepareMusic()`/`prepareVideo()` 里写的是
+   `if (work != FeedPage.this.work) return;` —— 两边都是同一个字段，恒为 false。
+   页面被复用后，上一条作品的异步解包结果会挂到新作品上（或把新作品的解包状态清掉）。
+
+### 改动
+- `FeedPage.prepareAlbum()` 挂 `visualFallback`（1.5 秒）：首图迟迟不来也放行音乐；
+  首图回调命中时取消兜底。视频、下载完成后的重载也统一走 `armVisualFallback()`。
+- 新增 `ensureMusic()`：一屏只主动查一次独立音乐目录；`prepareMusic()` 里
+  「播放器已在跑」不再误把音乐图标藏掉。
+- 作品包音乐解包失败 / `MediaPlayer` 报错各给最多 2 次、间隔 1.2 秒的重试；
+  `bind()` / `releasePlayers()` 会取消在途重试。
+- 解包回调用 `final Work bound = work` 捕获绑定时的作品，杜绝串页。
+- `LibraryScanner.loadMusicSync()` 改成返回「是否真的读到目录」：只有成功才置
+  `musicChecked`；`loadMusic()` 对失败自动隔 400ms 重试一次。
+  另外给旧版本落盘的假 `musicChecked=true` 一次按作品复查机会（`musicRechecked`）。
+- `App` 新增单线程 `music` 执行器，`loadMusic()` 不再排在 10 个预热任务后面。
+- `MediaPlayer` 先挂到字段再 `prepareAsync()`，异步回调校验 `mediaPlayer == musicPlayer`；
+  `setDataSource` 抛异常时也会真正释放刚创建的播放器。
+
+### 验证
+- `tools\run-tests.ps1`：**PASS 150 / FAIL 0**（新增 7 项：音乐名/体积/`musicChecked`
+  落盘往返，tar 作品合并与往返后音乐仍在包里且 offset/size 不丢）。
+- `android\build.ps1 -Test` 全流程通过，产物 v1.0.20。
+
+> 说明：本轮仍无真机回归（adb 在当前环境起不来）。装机后请重点验证：
+> 「随机观看」连续刷过几个图集，背景音乐应在 1~2 秒内响起，且不会串到上一条；
+> 断网/弱网下首图加载失败时音乐仍能播放；滑走再滑回来音乐继续。
+
+---
+
+## 第四十轮：代码审查后的缺陷修复与工程整理（2026-11-12）
+
+一次全量只读审查后的集中修复，不新增功能，重点放在「错了不容易被发现」的地方。
+
+### 修复
+- **播放**：`FeedPage.prepareVideo()` 里 `MediaPlayer` 先挂到字段再 `setDataSource()`，
+  加载失败时不再泄漏一个含 native 资源的播放器（此前只有 `prepareMusic()` 修过）。
+- **凭据**：`HttpLite.request()` 跟随重定向时校验同源，跨主机剥掉
+  `Authorization` / `Destination`，并拒绝 https → http 降级，Basic 账号不会被送给第三方。
+- **路径**：`DavClient.urlFor()` 拒绝 `..` 段，`relFromHref()` 把含 `..` 的 href 当脏数据丢掉，
+  避免 WebDAV 响应把删除 / MOVE 操作引到片库根之外。
+- **资源**：`DavClient.RangeStream.close()` 先关响应流再断连接；
+  `LibraryStore.writeAtomically()` 写失败会恢复 `dirty` 并退避重试（原来静默丢更新，
+  连 `renameTo` 的返回值都没检查）。
+- **回调**：`ImageLoader` 封面任务抛异常时补占位图 + 退避标记；`clearDisk()` 清空 pending
+  前给在途回调回一次空结果；`SetupActivity` 两个后台回调补 `isFinishing/isDestroyed`。
+- **下载**：`OfflineStore` 未配置 WebDAV 时直接给明确错误，不再白等 3 次 NPE 重试。
+- **性能**：`DavTarSource.read()` 加 64KB 顺序预读缓存，列 tar 头不再每 512B 发一次
+  HTTPS Range 请求；`MediaProxy` 缓存体积统计移出 `sizeLock`、改迭代遍历，
+  并只让一个线程扫目录。
+
+### 工程
+- `build.ps1` / `run-tests.ps1` 按「项目自带 → 环境变量 → 上层共享」找 JDK / SDK / json.jar，
+  `tools\json.jar` 随项目走，单独拷走目录也能构建；`build.ps1` 存为 UTF-8 BOM
+  （PowerShell 5.1 之前会按 GBK 误读中文注释，改动后中文变多直接触发语法错误）。
+- `run-tests.ps1` 把 cwd 固定到项目根：之前从 `android\` 调用会把测试临时 tar 建到
+  `android/android/` 下（已堆了 112 个），从别的目录调用则直接失败。
+- `-NoBump` 不再重写 `version.properties`；build 目录被占用时改名到 `android/build-stale/`。
+- `.gitignore` 补齐带版本号 APK、`build-*`、`build-stale/`、内嵌 SDK/JDK、模拟器与日志，
+  `git status` 不再被几十个中间产物淹没。
+
+### 验证
+- `tools\run-tests.ps1`：**PASS 158 / FAIL 0**（新增 8 项：同源重定向保留凭据 / Destination，
+  跨源重定向剥离 Authorization / Destination）。
+- `android\build.ps1 -NoBump -Test`：资源编译 → javac → d8 → 打包 → apksigner 全流程通过，
+  产物 v1.0.20（0.18 MB），`version.properties` 未被改动。
+
+### 未处理（涉及产品取舍，需要确认）
+- 「允许自签名证书」目前是 trust-all + 关闭主机名校验，等于对该连接完全放弃 TLS 校验；
+- `http://` 地址配合全局 `usesCleartextTraffic="true"`，Basic 凭据会明文上网；
+- 本地 `127.0.0.1` 媒体代理没有 token 鉴权，同机其它 App 猜到 key 就能读缓存；
+- 密码明文存在 `SharedPreferences`。
+这几项都会改变家用 NAS / 明文 WebDAV 的可用性，本轮没有擅自改动语义。
+
+> 说明：本轮仍无真机回归。装机后请重点验证：连自签 NAS 时扫描 / 播放仍正常（重定向
+> 策略变严）、tar 作品首次打开详情明显变快、首页缓存体积显示不再偶发跳 0。
+
+## 第四十一轮：播放页侧栏顺序与双击收藏（2026-11-12）
+
+### 需求
+播放作品时「评论」和「收藏」换位置、「评论」按钮换成「详情」、在作品画面上双击即收藏。
+
+### 改动
+- `FeedPage.java`：右侧栏顺序由「评论 → 分享 → 收藏 → 自动下载」改成
+  「收藏 → 分享 → 详情 → 自动下载」；原「评论」按钮本来打开的就是作品详情弹层
+  （`FeedActivity.showInfo()`），现在图标换成 `ic_info`、文案改成「详情」，
+  `commentIcon` / `HIT_COMMENT` 一并改名 `detailIcon` / `HIT_DETAIL`（命中值仍是 4）。
+- `FeedPager.java`：`Listener.onDoubleTap` 早就声明却从未被调用，`HeartBurstView` 也一直
+  没接进视图树。现在内容区的第一下单击先压 260ms 等双击：窗口内第二下（位移不超过
+  `ViewConfiguration.getScaledDoubleTapSlop()`）触发 `onDoubleTap`，否则补发单击。
+  侧栏按钮 / 进度条 / 话题点击立即生效并补发上一击；滑动、长按、多指、翻页时撤销待判定单击。
+- `FeedActivity.java`：双击是「点赞式收藏」，只加不减（先 `isFavorite()` 判断，避免误取消），
+  成功后刷新星星状态 + 震动 + toast，并在手指位置冒心心；回收站预览里提示先恢复。
+- 单击暂停因此有 260ms 判定延迟（此前立即生效），这是让双击生效的必要代价；
+  按钮点击、翻页、长按倍速不受影响。
+
+### 验证
+- `android\build.ps1 -Test`：单元测试 **PASS 158 / FAIL 0**，资源编译 → javac → d8 →
+  打包 → apksigner 全流程通过；版本号按脚本惯例自增到 **v1.0.21（code 31）**。
+- 手势逻辑没有自动化用例，需真机验证：侧栏四个按钮的位置与点击、单击暂停、双击收藏
+  （星星变金色 / 心心动画 / 已收藏再双击不取消）、双击时画面不闪。
+
+## 第四十二轮：分享作品时打包成 tar（2026-11-12）
+
+### 需求
+点分享按钮不再只发文案，而是把当前作品的所有文件打包成一个 tar 再分享。
+
+### 改动
+- 新增 `TarWriter.java`：纯 Java 的 USTAR 写入器（512 字节头、八进制 size/mtime、
+  校验和、`name/prefix` 长路径拆分、512 对齐、流式 256KB 缓冲、读取长度不符即报错、
+  可中途取消）。项目此前只有 `TarReader`（读），没有写 tar 的代码，也没有第三方库。
+- 新增 `ShareProvider.java` + Manifest `<provider>`：项目不依赖 androidx、没有 FileProvider，
+  自己实现只读 ContentProvider，只暴露 `getCacheDir()/share/` 下的 .tar，
+  `exported=false` + `grantUriPermissions=true`，`query()` 返回 DISPLAY_NAME / SIZE，
+  用 canonical 路径校验挡住路径穿越。
+- 新增 `WorkShare.java`：遍历 `work.workFiles()`（视频 / 实况 / 图集 / 文案 / 音乐），
+  按「离线本地 → ArchiveStore 解包缓存 → WebDAV 流式」分流取流；同名成员加序号，
+  进度按字节估算，24 小时前的旧包自动清理，失败时删掉 `.part`。
+- `FeedActivity.share()`：改成 `app.io.execute` 后台打包 + `Ui.busy` 进度框 + 「取消」按钮 +
+  防重复点击 + `onDestroy` 置取消标志；完成后 `ACTION_SEND` + `application/x-tar` +
+  `content://`，`clipData` 与 chooser / target 两处 `FLAG_GRANT_READ_URI_PERMISSION`
+  双保险。回收站预览直接提示先恢复。
+
+### 验证
+- `TarWriter` 加入 `run-tests.ps1` 的纯 Java 编译列表，新增「分享打包往返」17 项：
+  中文名 / 700 字节非对齐 / 空文件 / 长中文路径 prefix / 512 对齐 / checksum /
+  短读报错 / 中途取消 / 路径清洗。单元测试 **PASS 175 / FAIL 0**（原 158）。
+- 交叉验证：同一份 `share.tar` 用系统 `tar -tvf` 与 Python `tarfile` 都能正确列出
+  4 个成员及大小（含长中文路径），不是只有自家的 `TarReader` 能读。
+- `aapt2 dump xmltree` 确认 APK Manifest 中 provider 的 name / exported=false /
+  authorities / grantUriPermissions 均已写入。
+- `android\build.ps1 -Test`：资源编译 → javac → d8 → 打包 → apksigner 全流程通过，
+  版本号按脚本惯例自增到 **v1.0.22（code 32）**。
+
+### 待真机验证
+- 点分享后的进度框、取消、大视频打包耗时与磁盘占用；
+- 目标应用（微信 / 网盘 / 文件管理器）能否拿到 URI 并读到文件（临时授权是否生效）；
+- 作品包（tar 成员）与未配置 WebDAV 时的错误提示。
+
+## 第四十三轮：无文案作品不显示抖音作品 ID（2026-11-12）
+
+### 需求
+播放作品时，明明没有文案，底部却显示一长串数字（抖音作品 ID）。
+
+### 原因
+电脑版把作品打包成 `<作品id>.tar`，`Work.archiveSkeleton()` / `fromJson()` 会把去掉
+`.tar` 后的纯数字串写进 `title` / `folderTitle`；而 `Work.captionLine()` 在
+`captionText` 为空时 `return value.isEmpty() ? title : value`，于是这串文件名被当成文案
+显示。`displayTitle()` 又同样回退到 `title` / `folderTitle`，所以首页卡片、收藏列表、
+详情弹层和分享 tar 的文件名也会出现它。散目录作品如果目录名剥完时间戳只剩作者名，
+也会被当成文案显示。
+
+### 改动
+- `Work.java`：新增 `looksLikeWorkId()`（6~32 位纯数字才算 ID）、`hasCaption()`、
+  `usableTitle()`；`captionLine()` 只返回真实文案，没有就返回空串；
+  `displayTitle()` 过滤掉 ID 型的 title / folderTitle，最终兜底为 `@作者 的作品`
+  （无作者时 `抖音作品`）。**`title` / `folderTitle` 字段本身不动**，
+  所以按 ID 搜索、排序、路径定位都不受影响。
+- `FeedPage.setCaption()`：空文案把整行 `GONE`（不只是设空文本，避免留下 8dp 空白）；
+  详情读完后的刷新统一走 `work.captionLine()`，有文案显示、确实没有保持隐藏。
+  `handleCaptionTap()` 本来就检查 `VISIBLE`，隐藏后话题点击不会误触发。
+- `FeedActivity.sendTar()`：无文案时不再拼出前导空行，文案与链接都为空就不放
+  `EXTRA_TEXT`；`EXTRA_SUBJECT` 仍用 `displayTitle()`，跟着一起不再带 ID。
+
+### 验证
+- 新增「空文案不显示作品 ID」26 项：ID 判定边界（6 / 19 位、中文名、带下划线、
+  空串 / null）、tar 骨架空文案、落盘往返后仍为空、文案解析后文案与标题都恢复正常、
+  纯空白文案、中文目录名不冒充文案但可作标题、有文案时正常显示。
+  单元测试 **PASS 201 / FAIL 0**（原 175）。
+- `android\build.ps1 -NoBump -Test`：资源编译 → javac → d8 → 打包 → apksigner 全流程通过。
+- 最终 `android\build.ps1 -Test` 同样全绿，版本号按脚本惯例自增到
+  **v1.0.23（code 33）**，产物 `android/JingYing-Watch-v1.0.23.apk`。
+- 改动前 6 个文件备份在 `%TEMP%\jingying-watch-backup-20261112\caption-20261112\`。
+
+### 待真机验证
+- 无文案的 `<作品id>.tar` 作品：播放页底部只剩发布时间一行，不残留空白间距；
+- 详情弹层 / 首页卡片 / 收藏列表 / 分享文件名显示 `@作者 的作品` 是否可接受；
+- 文案.txt 读取完成后（详情异步加载），文案能从隐藏状态正常出现。
+
+## 第四十四轮：图集作品滑动延迟（2026-11-12）
+
+### 需求
+图集作品左右滑切图感觉有延迟、不跟手。
+
+### 排查
+只读审查了 `FeedPager`（手势）、`FeedPage.showAlbumImage`（切图）、`ImageLoader`（解码/缓存）、
+`MediaProxy.readAll`（取流）全链路，确认**没有在主线程解码 Bitmap**，延迟来自下面几处：
+
+- 图集图片**零预取**：`FeedActivity.prefetchAhead()` 只预热 `work.video`，
+  `work.video == null` 的图集直接跳过；划一张才请求一张。
+- 缓存未命中时 `showAlbumImage()` 不清 cover、不显示 loading：角标和进度条立刻变，
+  画面还是上一张，要等 `MediaProxy.readAll()` 整图下载（最长 45s）+ 全分辨率解码。
+- 图集大图和封面**共用 48MB LruCache**：一张 1080×1920 RGB_565 约 4MB，
+  翻页封面 / 轮播一挤就被淘汰，来回切反复解码 + 上传 + GC。
+- `FeedPager` 要划过 **12% 屏宽**才切图，`ACTION_UP` 的 `albumSwipe` 分支直接 return，
+  没有竖直方向那样的抬手速度兜底：短快横扫被完全吞掉。
+- 轮播 ticker 固定 3.2s 自续且和手势切图共用 3 条 cover 线程，网络慢时会堆任务。
+
+### 改动
+- 新增 `AlbumNav.java`（纯 Java、可单测）：循环索引 `wrap`、相邻预取目标 `neighbors`、
+  拖动阈值 `dragCrossed`、抬手快扫兜底 `flingCrossed`。
+  `FeedPage` 的轮播 / 上一张 / 下一张统一改走 `wrap`，阈值不再散落内联。
+- `ImageLoader.java`：
+  - 图集大图分出**独立 `albumMemory`**（min(64MB, maxMemory/4)），不再被封面挤掉；
+    `loadImage` / `loadLocalImage` 命中缓存时同步回调，切图当帧换画面。
+  - `loadImage` / `loadLocalImage` 合并为可指定线程池的 `runImageTask()`；
+    新增 `prefetchImage()` 走**单线程、MIN_PRIORITY 的 `prefetchPool`**，只写缓存不改界面。
+  - 预取刻意**不占 `pending`**（用独立 `prefetching` set 去重）：否则用户正好切到
+    「正在预取」的那张时，正式请求会挂到低优先级单线程后面排队，比不做预取还慢。
+    预取先完成且有正式请求在等就顺手交付；预取失败则不消费等待队列，交给
+    高优先级线程自己交付，避免画面永远停在旧图。
+  - `clearDisk()` 一并清 `albumMemory` 与 `prefetching`。
+- `FeedPage.java`：每次 `showAlbumImage()` 后对当前屏预取前后相邻图
+  （`AlbumNav.neighbors`，两张图只预取一次、单张不预取），按离线本地 / WebDAV 分流。
+- `FeedPager.java`：切图阈值 12% → **8%**（`AlbumNav.dragCrossed`），
+  `ACTION_UP` 的 `albumSwipe` 分支按抬手位移 + 速度补切一张
+  （`flingCrossed`，位移 > 5% 屏宽且 > 300px/s）；一次手势仍只切一张。
+
+### 验证
+- 新增「图集切图与预取」23 项：循环索引正负数 / 空图集 / 越界回绕，
+  相邻预取目标（3 张 / 2 张 / 1 张 / 空 / 末位回绕），8% 拖动阈值，
+  快扫 / 慢推 / 位移不足 / 时长为 0。单元测试 **PASS 224 / FAIL 0**（原 201）。
+- `android\build.ps1 -NoBump -Test` 两轮均全绿（含修正预取调度前后）：
+  资源编译 → javac → d8 → 打包 → apksigner。
+- 最终 `android\build.ps1 -Test` 同样全绿，版本号按脚本惯例自增到
+  **v1.0.24（code 34）**，产物 `android/JingYing-Watch-v1.0.24.apk`。
+- 改动前 7 个文件备份在 `%TEMP%\jingying-watch-backup-20261112\album-20261112\`。
+
+### 待真机验证
+- 连续左右划 10+ 张是否不再出现「角标变了但画面没换」；
+- 短促快扫能不能切一张、上下滑翻作品有没有被误判成切图；
+- 大图集（20+ 张）来回划的内存占用与 GC 抖动；
+- 冷启动第一张（WebDAV 冷数据）仍会等网络，这是带宽下限；
+  若仍觉得慢，下一步可做「低分辨率快速预览 → 全宽图替换」的渐进式加载。
+- 本轮**未动**翻页吸附结束帧 `bindSlots()` 的三次 `bind()`（含同步
+  `MediaPlayer.release()`）。如果卡顿发生在「上下滑翻到图集」而不是「左右切图」，
+  那是另一条路径，需要单独处理。

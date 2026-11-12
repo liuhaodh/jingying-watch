@@ -73,6 +73,8 @@ public final class Work {
     public RemoteFile video;
     public RemoteFile music;
     public RemoteFile caption;
+    /** 2026-11-08 起电脑版一个作品一个 tar；散目录作品这里是 null。 */
+    public RemoteFile archive;
     public final List<RemoteFile> images = new ArrayList<>();
     public final List<RemoteFile> lives = new ArrayList<>();
     public boolean detailsLoaded;
@@ -111,6 +113,50 @@ public final class Work {
         Work work = skeleton(rel, authorRel, author, uniqueId, folder, mtime);
         work.musicChecked = musicChecked;
         work.music = music;
+        boolean has = work.applyFiles(files);
+        return has ? work : null;
+    }
+
+    /** 作者目录下的一个 `<作品id>.tar`：详情（成员清单）等到打开时再读。 */
+    public static Work archiveSkeleton(String rel, String authorRel, String author,
+                                       String uniqueId, String tarName, long tarSize,
+                                       long mtime) {
+        Work work = skeleton(rel, authorRel, author, uniqueId, tarName, mtime);
+        work.archive = new RemoteFile(rel, tarName, tarSize);
+        String title = TarReader.safeName(tarName);
+        if (title.toLowerCase(Locale.US).endsWith(".tar")) {
+            title = title.substring(0, title.length() - 4);
+        }
+        if (!title.isEmpty()) {
+            work.folderTitle = title;
+            work.title = title;
+        }
+        // 电脑版打包后把 tar 的 mtime 设成作品发布时间；打开前先用它排序，
+        // 详情读出来后会被文案里的发布时间覆盖。
+        work.time = mtime > 0 ? mtime : 0L;
+        work.invalidateDisplay();
+        return work;
+    }
+
+    /**
+     * 用 tar 成员清单构建作品详情。成员都是 `RemoteFile`，带上
+     * archiveRel + offset，播放/看图时由 ArchiveStore 按偏移解包。
+     */
+    public static Work fromArchive(Work base, List<TarReader.Member> members) {
+        if (base == null || base.archive == null || members == null) {
+            return null;
+        }
+        List<RemoteFile> files = new ArrayList<>();
+        for (TarReader.Member member : members) {
+            files.add(new RemoteFile(base.archive.rel, member.name, member.size,
+                    base.archive.rel, member.offset));
+        }
+        Work work = skeleton(base.rel, base.authorRel, base.author, base.uniqueId,
+                base.folder, base.mtime);
+        work.archive = base.archive;
+        if (base.time > 0) {
+            work.time = base.time;
+        }
         boolean has = work.applyFiles(files);
         return has ? work : null;
     }
@@ -199,6 +245,70 @@ public final class Work {
         return !empty;
     }
 
+    /** tar 作品的详情合并：沿用 mergeDetails，再把 archive 挂回去。 */
+    public boolean mergeArchiveDetails(Work other) {
+        boolean ok = mergeDetails(other);
+        if (other != null && other.archive != null) {
+            archive = other.archive;
+        }
+        return ok;
+    }
+
+    /**
+     * 重新扫描时扫描器手里只有骨架（没有文件清单），不能拿它整个盖掉已经读过详情的对象：
+     * 否则封面、图集类型、文案、音乐全部丢失，首页格子会集体变回占位图。
+     * 只合并目录名里可能变化的字段（作者、目录名、时间、mtime）。
+     *
+     * @return 是否有字段真的变了
+     */
+    public boolean mergeSkeleton(Work other) {
+        if (other == null) {
+            return false;
+        }
+        boolean changed = false;
+        if (archive == null && other.archive != null) {
+            archive = other.archive;
+            changed = true;
+        }
+        if (!other.authorRel.isEmpty() && !other.authorRel.equals(authorRel)) {
+            authorRel = other.authorRel;
+            changed = true;
+        }
+        if (!other.author.isEmpty() && !other.author.equals(author)) {
+            author = other.author;
+            changed = true;
+        }
+        if (!other.uniqueId.isEmpty() && !other.uniqueId.equals(uniqueId)) {
+            uniqueId = other.uniqueId;
+            changed = true;
+        }
+        if (!other.folder.isEmpty() && !other.folder.equals(folder)) {
+            folder = other.folder;
+            if (other.folderTitle != null && !other.folderTitle.isEmpty()) {
+                folderTitle = other.folderTitle;
+                // 文案已经解析过时 title 是「文案首行」，别被目录名盖回去
+                if (captionText.trim().isEmpty()) {
+                    title = other.folderTitle;
+                }
+            }
+            changed = true;
+        }
+        if (other.time > 0 && other.time != time
+                && (captionText.trim().isEmpty() || !detailsLoaded)) {
+            // 已经读过文案的作品，发布时间以文案为准；别被 tar 的 mtime 覆盖回去
+            time = other.time;
+            changed = true;
+        }
+        if (other.mtime > 0 && other.mtime != mtime) {
+            mtime = other.mtime;
+            changed = true;
+        }
+        if (changed) {
+            invalidateDisplay();
+        }
+        return changed;
+    }
+
     // ---------- 展示 ----------
     public String key() {
         if (cachedKey == null) {
@@ -215,17 +325,58 @@ public final class Work {
         return "album".equals(kind);
     }
 
+    /** 这个作品是电脑版打的 `<作品id>.tar`（文件都在包里）。 */
+    public boolean isArchive() {
+        return archive != null;
+    }
+
+    /**
+     * 电脑版把作品打包成 `<作品id>.tar`，扫进来的 title / folderTitle 就是这串数字。
+     * 它是文件名，不是用户可读的文案或标题，别拿来当作品名显示。
+     */
+    public static boolean looksLikeWorkId(String text) {
+        if (text == null) {
+            return false;
+        }
+        String value = text.trim();
+        if (value.length() < 6 || value.length() > 32) {
+            return false;
+        }
+        for (int index = 0; index < value.length(); index++) {
+            char c = value.charAt(index);
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 有没有真正的文案；目录名 / tar 名不算文案。 */
+    public boolean hasCaption() {
+        return captionText != null && !captionText.trim().isEmpty();
+    }
+
+    /** 纯数字作品 ID 不是可读标题，返回空串让调用方继续回退。 */
+    private static String usableTitle(String value) {
+        if (value == null || looksLikeWorkId(value)) {
+            return "";
+        }
+        return value.trim();
+    }
+
     public String displayTitle() {
         String cached = cachedTitle;
         if (cached != null) {
             return cached;
         }
-        String value = captionText != null && !captionText.trim().isEmpty() ? captionText : title;
-        if (value == null || value.trim().isEmpty()) {
-            value = folderTitle;
+        String value = hasCaption() ? captionText : usableTitle(title);
+        if (value.isEmpty()) {
+            value = usableTitle(folderTitle);
         }
-        if (value == null || value.trim().isEmpty()) {
-            value = "抖音作品";
+        if (value.isEmpty()) {
+            // 没有文案、目录名又只有作品 ID 时，给个能读的兜底，别把一长串数字甩给用户
+            String name = author == null ? "" : author.trim();
+            value = name.isEmpty() ? "抖音作品" : "@" + name + " 的作品";
         }
         cached = value.trim();
         cachedTitle = cached;
@@ -264,9 +415,9 @@ public final class Work {
         cachedSearch = null;
     }
 
+    /** 播放页文案：只返回真正的文案；没文案就空着，不拿目录名 / 作品 ID 冒充。 */
     public String captionLine() {
-        String value = captionText == null ? "" : captionText.trim();
-        return value.isEmpty() ? title : value;
+        return hasCaption() ? captionText.trim() : "";
     }
 
     public RemoteFile coverFile() {
@@ -334,6 +485,9 @@ public final class Work {
             json.put("captionText", captionText);
             json.put("aweme", awemeId);
             json.put("share", shareUrl);
+            if (archive != null) {
+                json.put("archiveFile", archive.toJson());
+            }
             if (detailsLoaded) {
                 JSONArray array = new JSONArray();
                 for (RemoteFile file : workFiles()) {
@@ -375,6 +529,23 @@ public final class Work {
         work.captionText = json.optString("captionText", "");
         work.awemeId = json.optString("aweme", "");
         work.shareUrl = json.optString("share", "");
+        work.archive = RemoteFile.fromJson(json.optJSONObject("archiveFile"), rel);
+        if (work.archive == null && !work.detailsLoaded
+                && TarReader.looksLikeTar(RemoteFile.baseName(rel))) {
+            // 旧版本恢复/重建出来的条目只有 `.tar` 路径、没有 archive 字段：
+            // 这里补成作品包，避免打开时对一个文件做 PROPFIND 读不出内容
+            String name = RemoteFile.baseName(rel);
+            work.archive = new RemoteFile(rel, name, 0L);
+            String title = name.substring(0, name.length() - 4);
+            if (work.folderTitle == null || work.folderTitle.isEmpty()
+                    || work.folderTitle.equals(name)) {
+                work.folderTitle = title;
+                if (work.captionText.isEmpty()) {
+                    work.title = title;
+                }
+            }
+            work.invalidateDisplay();
+        }
         if (work.detailsLoaded) {
             List<RemoteFile> files = new ArrayList<>();
             JSONArray array = json.optJSONArray("files");

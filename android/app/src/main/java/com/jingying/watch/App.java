@@ -20,11 +20,16 @@ public final class App extends Application {
     public ImageLoader images;
     public AvatarStore avatars;
     public OfflineStore offline;
+    /** 作品包（tar）按成员解包缓存。 */
+    public ArchiveStore archives;
     public FavoriteStore favorites;
     public TrashStore trash;
     public Handler main;
     public ExecutorService io;
     public ExecutorService details;
+    /** 背景音乐查询单独排队：播放页会一次预热后面 10 个作品的详情，
+     *  音乐不能排在那 10 个任务后面（滑得快就一直没声音）。 */
+    public ExecutorService music;
 
     private volatile DavClient dav;
 
@@ -40,8 +45,10 @@ public final class App extends Application {
         prefs = new Prefs(this);
         io = Executors.newFixedThreadPool(4, daemon("watch-io"));
         details = Executors.newFixedThreadPool(3, daemon("watch-details"));
+        music = Executors.newSingleThreadExecutor(daemon("watch-music"));
         store = new LibraryStore(this);
         offline = new OfflineStore(this);
+        archives = new ArchiveStore(this);
         io.execute(() -> {
             store.load();
             offline.load();
@@ -92,6 +99,10 @@ public final class App extends Application {
         DavClient current = dav();
         proxy.setClient(current);
         proxy.setCacheLimit(prefs.cacheMb() * 1024L * 1024L);
+        // 连接变了：之前只画了占位图的封面值得再试一次
+        if (images != null) {
+            images.retryFailedCovers();
+        }
     }
 
     public void runOnMain(Runnable runnable) {

@@ -49,6 +49,10 @@ public final class OfflineStore {
     private final Set<String> downloading = Collections.synchronizedSet(new HashSet<String>());
     private final List<Listener> listeners = new CopyOnWriteArrayList<>();
     private volatile boolean loaded;
+    /** 正在扫描/等待扫描的标记，避免 has() 每次都往 io 线程丢任务。 */
+    private volatile boolean loadQueued;
+    /** 下载途中被用户删掉的作品：别在下载线程收尾时又把它写回索引。 */
+    private final Set<String> cancelled = Collections.synchronizedSet(new HashSet<String>());
     /** 读不到目录时（比如外置存储还没挂载）最多每 3 秒重试一次。 */
     private long lastLoadAt;
     private final ExecutorService pool = Executors.newSingleThreadExecutor(new ThreadFactory() {
@@ -133,6 +137,10 @@ public final class OfflineStore {
             if (!dir.isDirectory()) {
                 continue;
             }
+            if (isDownloadingDir(dir.getName())) {
+                // 正在下载的目录还没写 meta.json，别当成垃圾删掉
+                continue;
+            }
             File meta = new File(dir, "meta.json");
             if (!meta.isFile()) {
                 deleteRecursive(dir);
@@ -153,15 +161,53 @@ public final class OfflineStore {
         loaded = true;
     }
 
+    private boolean isDownloadingDir(String dirName) {
+        if (downloading.isEmpty() || dirName == null) {
+            return false;
+        }
+        synchronized (downloading) {
+            for (String rel : downloading) {
+                if (rel != null && ("w" + Util.sha1Hex(rel).substring(0, 16)).equals(dirName)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /** 冷启动时片库和首页可能先于后台 load 就绪，这里保证离线判断是准的。 */
     private void ensureLoaded() {
-        if (!loaded) {
-            load();
+        if (loaded) {
+            return;
         }
+        // 整理目录 + 解析 meta.json 可能要几百毫秒，绝不能放在主线程（has() 就在 bind 里调用）。
+        // 先返回「没有下载」，索引建好后 notifyChanged(null) 会让界面重新绑定。
+        loadAsync();
+    }
+
+    private void loadAsync() {
+        if (loaded || loadQueued) {
+            return;
+        }
+        loadQueued = true;
+        app.io.execute(() -> {
+            try {
+                load();
+            } finally {
+                loadQueued = false;
+            }
+            if (loaded) {
+                notifyChanged(null);
+            }
+        });
     }
 
     private boolean hasMainFile(Work work) {
         File dir = dirFor(work);
+        if (work.archive != null) {
+            // 一个作品一个 tar：本地只要这个包在且大小对得上就算已下载
+            return fileOk(new File(dir, work.archive.name), work.archive.size);
+        }
         if (work.video != null) {
             return fileOk(new File(dir, work.video.name), work.video.size);
         }
@@ -210,7 +256,7 @@ public final class OfflineStore {
     public File localVideo(Work work) {
         ensureLoaded();
         Work stored = saved.get(work.rel);
-        if (stored == null || stored.video == null) {
+        if (stored == null || stored.archive != null || stored.video == null) {
             return null;
         }
         File file = new File(dirFor(stored), stored.video.name);
@@ -220,7 +266,8 @@ public final class OfflineStore {
     public File localImage(Work work, int index) {
         ensureLoaded();
         Work stored = saved.get(work.rel);
-        if (stored == null || index < 0 || index >= stored.images.size()) {
+        if (stored == null || stored.archive != null
+                || index < 0 || index >= stored.images.size()) {
             return null;
         }
         File file = new File(dirFor(stored), stored.images.get(index).name);
@@ -230,11 +277,39 @@ public final class OfflineStore {
     public File localMusic(Work work) {
         ensureLoaded();
         Work stored = saved.get(work.rel);
-        if (stored == null || stored.music == null) {
+        if (stored == null || stored.archive != null || stored.music == null) {
             return null;
         }
         File file = new File(dirFor(stored), stored.music.name);
         return file.isFile() ? file : null;
+    }
+
+    /** 已下载的作品包（tar）；没有或大小不对返回 null。 */
+    public File savedTar(Work work) {
+        ensureLoaded();
+        if (work == null || work.archive == null) {
+            return null;
+        }
+        Work stored = saved.get(work.rel);
+        if (stored == null || stored.archive == null) {
+            return null;
+        }
+        File file = new File(dirFor(stored), stored.archive.name);
+        if (!file.isFile()) {
+            return null;
+        }
+        if (stored.archive.size > 0 && file.length() < stored.archive.size) {
+            return null;
+        }
+        return file;
+    }
+
+    public File savedTarFor(String archiveRel) {
+        ensureLoaded();
+        if (archiveRel == null || archiveRel.isEmpty()) {
+            return null;
+        }
+        return savedTar(saved.get(archiveRel));
     }
 
     public Work stored(Work work) {
@@ -254,9 +329,16 @@ public final class OfflineStore {
         if (work == null) {
             return;
         }
+        if (downloading.remove(work.rel)) {
+            // 下载还在跑：标记一下，别让它在写 meta 的时候又把记录塞回索引
+            cancelled.add(work.rel);
+        }
         deleteRecursive(dirFor(work));
         saved.remove(work.rel);
         progress.remove(work.rel);
+        if (app.archives != null) {
+            app.archives.clear(work);
+        }
         if (app.images != null) {
             app.images.invalidateCover(work.key());
         }
@@ -264,6 +346,12 @@ public final class OfflineStore {
     }
 
     public void clearAll() {
+        synchronized (downloading) {
+            cancelled.addAll(downloading);
+        }
+        if (app.archives != null) {
+            app.archives.clearAll();
+        }
         File[] dirs = root.listFiles();
         if (dirs != null) {
             for (File dir : dirs) {
@@ -277,9 +365,29 @@ public final class OfflineStore {
         notifyChanged(null);
     }
 
+    /** 只统计真正会下载的文件（实况图 lives 不下载，不能算进进度分母）。 */
+    private static long downloadBytes(Work work) {
+        if (work.archive != null) {
+            return Math.max(0L, work.archive.size);
+        }
+        long total = 0;
+        if (work.video != null) {
+            total += work.video.size;
+        }
+        for (RemoteFile image : work.images) {
+            total += image.size;
+        }
+        if (work.music != null) {
+            total += work.music.size;
+        }
+        return total;
+    }
+
     private void doDownload(Work work) {
         File dir = dirFor(work);
         try {
+            // 下载线程上可以等索引读完：否则 has() 可能说「没下过」，把整条重新下一遍
+            load();
             if (!work.detailsLoaded && !ensureDetails(work)) {
                 throw new IllegalStateException("作品信息读取失败");
             }
@@ -291,6 +399,10 @@ public final class OfflineStore {
                 notifyChanged(work);
                 return;
             }
+            if (work.archive != null) {
+                downloadArchive(work, dir);
+                return;
+            }
             if (work.isAlbum() && !work.musicChecked) {
                 app.scanner.loadMusicSync(app.dav(), work);
             }
@@ -298,7 +410,15 @@ public final class OfflineStore {
             //noinspection ResultOfMethodCallIgnored
             dir.mkdirs();
 
-            long total = work.totalBytes();
+            long total = downloadBytes(work);
+            if (total > 0) {
+                long free = root.getUsableSpace();
+                if (free > 0 && free < (long) (total * 1.15)) {
+                    throw new IllegalStateException("手机剩余空间不足：需要约 "
+                            + Util.humanSize(total) + "，" + "当前只剩 "
+                            + Util.humanSize(free));
+                }
+            }
             if (total <= 0) {
                 total = 1;
             }
@@ -334,10 +454,16 @@ public final class OfflineStore {
             } else if (work.captionText != null && !work.captionText.isEmpty()) {
                 writeText(new File(dir, "文案.txt"), work.captionText);
             }
+            if (cancelled.remove(work.rel)) {
+                // 下载途中被用户删了：文件已经清掉，别再写 meta、也别写回索引
+                deleteChildren(dir);
+                return;
+            }
             JSONObject meta = new JSONObject();
             meta.put("savedAt", System.currentTimeMillis() / 1000L);
             meta.put("work", work.toJson());
-            writeText(new File(dir, "meta.json"), meta.toString());
+            // 原子写：meta.json 只写了一半就掉电，下次启动会被当成坏目录整个删掉
+            writeTextAtomic(new File(dir, "meta.json"), meta.toString());
             saved.put(work.rel, work);
             progress.put(work.rel, 100);
             if (app.images != null) {
@@ -350,10 +476,41 @@ public final class OfflineStore {
             progress.put(work.rel, -2);
             notifyChanged(work);
         } finally {
+            cancelled.remove(work.rel);
             downloading.remove(work.rel);
             android.util.Log.i("JYWatch", "offline done " + work.rel
                     + " size=" + dirSize(dir));
         }
+    }
+
+    /** 作品包：只把 `<作品id>.tar` 整个下到本地，播放时再由 ArchiveStore 解包。 */
+    private void downloadArchive(Work work, File dir) throws Exception {
+        long total = Math.max(1L, work.archive.size);
+        long free = root.getUsableSpace();
+        if (free > 0 && free < (long) (total * 1.15)) {
+            throw new IllegalStateException("手机剩余空间不足：需要约 "
+                    + Util.humanSize(total) + "，" + "当前只剩 "
+                    + Util.humanSize(free));
+        }
+        deleteChildren(dir);
+        //noinspection ResultOfMethodCallIgnored
+        dir.mkdirs();
+        File target = new File(dir, work.archive.name);
+        downloadFile(work, work.archive, target, 0L, total);
+        if (cancelled.remove(work.rel)) {
+            deleteChildren(dir);
+            return;
+        }
+        JSONObject meta = new JSONObject();
+        meta.put("savedAt", System.currentTimeMillis() / 1000L);
+        meta.put("work", work.toJson());
+        writeTextAtomic(new File(dir, "meta.json"), meta.toString());
+        saved.put(work.rel, work);
+        progress.put(work.rel, 100);
+        if (app.images != null) {
+            app.images.invalidateCover(work.key());
+        }
+        notifyChanged(work);
     }
 
     private boolean ensureDetails(Work work) {
@@ -369,6 +526,11 @@ public final class OfflineStore {
 
     private long downloadFile(Work work, RemoteFile file, File target,
                               long done, long total) throws Exception {
+        // 先取一次：没配 WebDAV 就直接给明确错误，别在重试循环里白等 3 次 NPE
+        final DavClient dav = app.dav();
+        if (dav == null) {
+            throw new IllegalStateException("还没有配置 WebDAV，无法下载");
+        }
         if (file.size > 0 && target.isFile() && target.length() >= file.size) {
             return done + file.size;
         }
@@ -380,7 +542,7 @@ public final class OfflineStore {
             attempts++;
             DavClient.RangeStream stream = null;
             try {
-                stream = app.dav().openStream(file.rel, 0);
+                stream = dav.openStream(file.rel, 0);
                 long written = 0;
                 try (FileOutputStream output = new FileOutputStream(part)) {
                     byte[] buffer = new byte[128 * 1024];
@@ -528,6 +690,23 @@ public final class OfflineStore {
         try (FileOutputStream output = new FileOutputStream(file)) {
             output.write(text.getBytes(Charset.forName("UTF-8")));
         } catch (Exception ignored) {
+        }
+    }
+
+    /** 先写 .tmp 再改名：掉电/进程被杀时不会留下半截 JSON（那种目录下次启动会被当垃圾删掉）。 */
+    private static void writeTextAtomic(File target, String text) throws Exception {
+        File temp = new File(target.getParentFile(), target.getName() + ".tmp");
+        try (FileOutputStream output = new FileOutputStream(temp)) {
+            output.write(text.getBytes(Charset.forName("UTF-8")));
+        } catch (Exception exc) {
+            //noinspection ResultOfMethodCallIgnored
+            temp.delete();
+            throw exc;
+        }
+        if (!temp.renameTo(target)) {
+            //noinspection ResultOfMethodCallIgnored
+            temp.delete();
+            throw new IllegalStateException("写入失败：" + target.getName());
         }
     }
 }

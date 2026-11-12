@@ -1,21 +1,49 @@
-param(
+﻿param(
     [string]$Configuration = "release",
-    [switch]$NoBump
+    [switch]$NoBump,
+    [switch]$Test
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$RepoRoot = Split-Path (Split-Path $Root -Parent) -Parent
-$ToolRoot = Join-Path $RepoRoot "tools"
-$Sdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { Join-Path $ToolRoot "android-sdk" }
-$Jdk = if ($env:JAVA_HOME) { $env:JAVA_HOME } else { "" }
-if (-not $Jdk -or -not (Test-Path $Jdk)) {
-    $jdkRoot = Join-Path $ToolRoot "jdk17"
-    $Jdk = if (Test-Path $jdkRoot) {
-        $candidate = Get-ChildItem $jdkRoot -Directory | Select-Object -First 1
-        if ($candidate) { $candidate.FullName } else { "" }
-    } else { "" }
+$ProjectRoot = Split-Path $Root -Parent                            # jingying-watch
+$LocalTools = Join-Path $ProjectRoot "tools"
+$SharedTools = Join-Path (Split-Path $ProjectRoot -Parent) "tools"
+
+# 优先用项目自带的工具链，整个 jingying-watch 目录拷走也能直接构建；
+# 找不到再依次回退到环境变量、上层工作区共享的 tools。
+function Resolve-Jdk {
+    param([string]$Base)
+    if (-not $Base -or -not (Test-Path $Base)) { return "" }
+    if (Test-Path (Join-Path $Base "bin\javac.exe")) { return $Base }
+    $child = Get-ChildItem $Base -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName "bin\javac.exe") } |
+        Select-Object -First 1
+    if ($child) { return $child.FullName }
+    return ""
 }
+
+$Sdk = ""
+foreach ($candidate in @(
+        (Join-Path $LocalTools "android-sdk"),
+        $env:ANDROID_HOME,
+        (Join-Path $SharedTools "android-sdk"))) {
+    if ($candidate -and (Test-Path (Join-Path $candidate "platforms\android-35\android.jar"))) {
+        $Sdk = $candidate
+        break
+    }
+}
+if (-not $Sdk) { $Sdk = Join-Path $LocalTools "android-sdk" }
+
+$Jdk = ""
+foreach ($candidate in @(
+        (Join-Path $LocalTools "jdk17"),
+        $env:JAVA_HOME,
+        (Join-Path $SharedTools "jdk17"))) {
+    $found = Resolve-Jdk $candidate
+    if ($found) { $Jdk = $found; break }
+}
+if (-not $Jdk) { $Jdk = $env:JAVA_HOME }
 $BuildTools = Join-Path $Sdk "build-tools\35.0.0"
 $Platform = Join-Path $Sdk "platforms\android-35\android.jar"
 
@@ -57,9 +85,10 @@ if (-not $NoBump) {
     if (-not [int]::TryParse($parts[2], [ref]$patch)) { $patch = 0 }
     $parts[2] = [string]($patch + 1)
     $VersionName = $parts[0] + "." + $parts[1] + "." + $parts[2]
+    # -NoBump 时保持 version.properties 完全不动，调试构建不该留下文件改动
+    Set-Content -Path $VersionFile -Encoding ASCII `
+        -Value @("versionCode=$VersionCode", "versionName=$VersionName")
 }
-Set-Content -Path $VersionFile -Encoding ASCII `
-    -Value @("versionCode=$VersionCode", "versionName=$VersionName")
 Write-Host "Version: $VersionName (code $VersionCode)" -ForegroundColor Yellow
 
 $Apk = Join-Path $Root ("JingYing-Watch-v" + $VersionName + ".apk")
@@ -69,13 +98,23 @@ if (Test-Path $Build) {
     try {
         Remove-Item $Build -Recurse -Force -ErrorAction Stop
     } catch {
-        # 目录被系统/杀软占用时改名绕开，别让整个构建挂掉
-        $stale = Join-Path $Root ("build-" + (Get-Date -Format "yyyyMMddHHmmss"))
+        # 目录被系统/杀软占用时改名绕开；统一收进 build-stale/（已被 .gitignore 忽略），
+        # 别在 android/ 根下堆一堆 build-<时间戳> 目录
+        $staleRoot = Join-Path $Root "build-stale"
+        New-Item -ItemType Directory -Force -Path $staleRoot | Out-Null
+        $stale = Join-Path $staleRoot ("build-" + (Get-Date -Format "yyyyMMddHHmmss"))
         Rename-Item $Build $stale -ErrorAction Stop
-        Write-Host "build 目录被占用，已改名为 $(Split-Path $stale -Leaf)" -ForegroundColor Yellow
+        Write-Host "build 目录被占用，已移到 $(Split-Path $stale -Leaf)" -ForegroundColor Yellow
     }
 }
 New-Item -ItemType Directory -Force -Path $Build, $Gen, $Classes, $DexDir | Out-Null
+
+if ($Test) {
+    Write-Host "[0/6] Running unit tests..." -ForegroundColor Cyan
+    $TestScript = Join-Path (Split-Path $Root -Parent) "tools\run-tests.ps1"
+    & powershell -ExecutionPolicy Bypass -File $TestScript -Quiet
+    if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
+}
 
 Write-Host "[1/6] Compiling resources..." -ForegroundColor Cyan
 & (Join-Path $BuildTools "aapt2.exe") compile --dir $Res -o $Compiled
@@ -97,6 +136,8 @@ if ($LASTEXITCODE -ne 0) { throw "aapt2 link failed" }
 
 Write-Host "[3/6] Compiling Java..." -ForegroundColor Cyan
 $JavaFiles = @(Get-ChildItem -Path $Src, $Gen -Recurse -Filter *.java | ForEach-Object { $_.FullName })
+# javac 会把「过时 API」提示写到 stderr，PowerShell Stop 模式会误判为失败
+$ErrorActionPreference = "Continue"
 & (Join-Path $Jdk "bin\javac.exe") `
     -encoding UTF-8 `
     -source 8 `
@@ -106,6 +147,7 @@ $JavaFiles = @(Get-ChildItem -Path $Src, $Gen -Recurse -Filter *.java | ForEach-
     -classpath $Platform `
     -d $Classes `
     $JavaFiles
+$ErrorActionPreference = "Stop"
 if ($LASTEXITCODE -ne 0) { throw "javac failed" }
 
 Write-Host "[4/6] Dexing..." -ForegroundColor Cyan

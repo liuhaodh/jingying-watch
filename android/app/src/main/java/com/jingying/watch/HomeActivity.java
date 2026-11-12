@@ -47,10 +47,23 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
     private final List<Work> allWorks = new ArrayList<>();
     private final Set<String> allRels = new HashSet<>();
     private List<Work> displayed = new ArrayList<>();
-    private long lastChipsAt;
+    /** allWorks 是否已按时间排序：扫描 incremental 追加时会短暂变乱。 */
+    private boolean worksSorted = true;
+    private boolean offlineDirty = true;
     private String lastChipFilter = "";
+    private boolean lastChipOffline;
+    /** 作者列表按索引 revision 缓存，搜索时只改高亮，不重建整排 chip。 */
+    private List<Library.AuthorInfo> cachedAuthors;
+    private int cachedAuthorsRevision = -1;
+    private int cachedAuthorsSize = -1;
+    private long builtAuthorsHash;
+    private int builtOfflineCount = -1;
+    private int cachedOfflineCount = -1;
+    private int cachedOfflineRevision = -1;
     private String lastRandomKey = "";
     private final Runnable rebuildRunnable = this::rebuildDisplayed;
+    /** 索引每次变化 revision 都会 +1，比「数量变没变」可靠（删一条又补一条时数量是相等的）。 */
+    private int lastRevision = -1;
     private String filterAuthor = "";
     private String query = "";
     private boolean offlineOnly;
@@ -65,8 +78,19 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
     private TextView continueText;
     private ProgressBar scanProgress;
     private EditText search;
+    /** 搜索防抖：停手 220ms 再筛，别每敲一个字就过一遍全库。 */
+    private final Runnable searchRunnable = () -> {
+        query = search == null ? "" : search.getText().toString().trim();
+        rebuildDisplayed();
+    };
     private LinearLayout chipsBox;
+    private HorizontalScrollView chipsScroll;
     private final List<TextView> chipViews = new ArrayList<>();
+    /** 作者 chip 分批挂上去：ListView 的表头每次布局都会重新 measure 所有子 view。 */
+    private List<Library.AuthorInfo> chipAuthors;
+    private int chipBuilt;
+    private TextView offlineChip;
+    private static final int CHIP_PAGE = 40;
 
     private int cellWidth;
     private int cellHeight;
@@ -346,8 +370,9 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
 
             @Override
             public void onTextChanged(CharSequence s, int start, int before, int count) {
-                query = s == null ? "" : s.toString().trim();
-                rebuildDisplayed();
+                // 每敲一个字就过一遍 1.6 万条太贵：停手 220ms 再筛
+                handler.removeCallbacks(searchRunnable);
+                handler.postDelayed(searchRunnable, 220L);
             }
 
             @Override
@@ -356,15 +381,25 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
         });
 
         // 作者筛选
-        HorizontalScrollView scroll = new HorizontalScrollView(this);
-        scroll.setHorizontalScrollBarEnabled(false);
+        chipsScroll = new HorizontalScrollView(this);
+        chipsScroll.setHorizontalScrollBarEnabled(false);
         LinearLayout.LayoutParams scrollParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         scrollParams.topMargin = Ui.dp(this, 12);
-        header.addView(scroll, scrollParams);
+        header.addView(chipsScroll, scrollParams);
         chipsBox = new LinearLayout(this);
         chipsBox.setOrientation(LinearLayout.HORIZONTAL);
-        scroll.addView(chipsBox);
+        chipsScroll.addView(chipsBox);
+        chipsScroll.setOnScrollChangeListener((view, x, y, oldX, oldY) -> {
+            if (chipAuthors == null || chipBuilt >= chipAuthors.size()) {
+                return;
+            }
+            View content = chipsBox;
+            int near = Ui.dp(this, 240);
+            if (content != null && x + view.getWidth() >= content.getWidth() - near) {
+                appendChips();
+            }
+        });
 
         // 扫描状态
         LinearLayout statusRow = new LinearLayout(this);
@@ -401,6 +436,8 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
             }
             allWorks.add(work);
         }
+        worksSorted = true;
+        lastRevision = app.store.revision();
         cachedStats = null;
         rebuildDisplayed();
         refreshCacheBytes();
@@ -428,7 +465,8 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
             // 没筛选时直接引用全量列表，避免每次刷新都复制/排序 1.6 万条
             base = allWorks;
         } else {
-            base = Library.filter(allWorks, filterAuthor, query, "all");
+            // 列表已经按时间排好时不用再排一遍（1.6 万条每次搜索都重排很贵）
+            base = Library.filter(allWorks, filterAuthor, query, "all", !worksSorted);
         }
         if (offlineOnly) {
             List<Work> onlyOffline = new ArrayList<>();
@@ -451,13 +489,21 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
         if (displayed.isEmpty()) {
             if (offlineOnly) {
                 emptyText.setText("还没有下载到本地的作品，长按封面可以下载");
-            } else if (prefs.hasDav()) {
-                emptyText.setText(scanning ? "正在从 WebDAV 拉取片库…"
-                        : "片库里还没有作品，先确认「净影」已上传到 WebDAV");
+                emptyAction.setText("重新扫描");
+                emptyAction.setVisibility(View.VISIBLE);
+            } else if (!query.isEmpty() || !filterAuthor.isEmpty()) {
+                // 筛选/搜索命中 0 条，不是「片库空」，别引导用户去重新扫描
+                emptyText.setText("没有匹配的作品，换个关键词或点「全部」");
+                emptyAction.setVisibility(View.GONE);
+            } else {
+                emptyText.setText(prefs.hasDav()
+                        ? (scanning ? "正在从 WebDAV 拉取片库…"
+                        : "片库里还没有作品，先确认「净影」已上传到 WebDAV")
+                        : "还没有连接 WebDAV 片库");
+                emptyAction.setText(prefs.hasDav() ? "重新扫描" : "去连接");
+                emptyAction.setVisibility(View.VISIBLE);
             }
             emptyText.setVisibility(View.VISIBLE);
-            emptyAction.setText(prefs.hasDav() ? "重新扫描" : "去连接");
-            emptyAction.setVisibility(View.VISIBLE);
         } else {
             emptyText.setVisibility(View.GONE);
             emptyAction.setVisibility(View.GONE);
@@ -470,12 +516,14 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
         }
         // 扫描时每 350ms 就会重建一次列表，全量统计 1.6 万条没必要跟着跑那么勤
         long now = System.currentTimeMillis();
-        if (cachedStats == null || now - cachedStatsAt > 800L) {
+        if (cachedStats == null || (!scanning && now - cachedStatsAt > 800L)) {
             cachedStats = Library.stats(allWorks);
             cachedStatsAt = now;
         }
         Library.Stats stats = cachedStats;
-        statsText.setText("作品 " + stats.count + "   ·   作者 " + stats.authors
+        // 扫描中列表在长，直接数当前条数；作者数用上一次的统计，别每个 batch 都去重一遍
+        int count = scanning ? allWorks.size() : stats.count;
+        statsText.setText("作品 " + count + "   ·   作者 " + stats.authors
                 + "   ·   缓存 " + Util.humanSize(cacheBytes));
         hostText.setText(prefs.hasDav() ? app.hostLabel() : "未连接 WebDAV");
     }
@@ -484,21 +532,92 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
         if (chipsBox == null) {
             return;
         }
-        long now = System.currentTimeMillis();
-        boolean filterChanged = !filterAuthor.equals(lastChipFilter);
-        if (!filterChanged && now - lastChipsAt < 1500) {
-            // 扫描时作者列表变化很频繁，节流重建 chips，避免主线程卡住
+        if (scanning) {
+            // 扫描期间作者列表每 350ms 变一次，重建几千个 chip 纯属浪费；
+            // onDone 里会把 scanning 置回 false 再重建一次。
             return;
         }
-        lastChipsAt = now;
+        List<Library.AuthorInfo> authors = cachedAuthors();
+        int offline = cachedOfflineCount();
+        long hash = authorHash(authors);
+        boolean authorsChanged = chipAuthors == null || hash != builtAuthorsHash;
+        if (!authorsChanged) {
+            // 下载数量变了只改「已下载 N」那一颗，别把整排 chip 重建（滚动位置会跳回最左）
+            if (offline != builtOfflineCount) {
+                builtOfflineCount = offline;
+                if (offlineChip != null) {
+                    offlineChip.setText("已下载 " + offline);
+                }
+            }
+            ensureChipBuilt(filterAuthor);
+            if (!filterAuthor.equals(lastChipFilter) || offlineOnly != lastChipOffline) {
+                updateChipStyles();
+            }
+            lastChipFilter = filterAuthor;
+            lastChipOffline = offlineOnly;
+            return;
+        }
         lastChipFilter = filterAuthor;
+        lastChipOffline = offlineOnly;
+        builtAuthorsHash = hash;
+        builtOfflineCount = offline;
+        chipAuthors = authors;
+        chipBuilt = 0;
         chipsBox.removeAllViews();
         chipViews.clear();
         addChip("全部", "");
-        addOfflineChip();
-        for (Library.AuthorInfo info : Library.authors(allWorks)) {
+        addOfflineChip(offline);
+        appendChips();
+        ensureChipBuilt(filterAuthor);
+    }
+
+    /** 一次只挂一页 chip；横向滚到接近末尾再追加下一页。 */
+    private void appendChips() {
+        if (chipAuthors == null) {
+            return;
+        }
+        int target = Math.min(chipAuthors.size(), chipBuilt + CHIP_PAGE);
+        for (int index = chipBuilt; index < target; index++) {
+            Library.AuthorInfo info = chipAuthors.get(index);
             addChip(info.name + " " + info.count, info.name);
         }
+        chipBuilt = target;
+    }
+
+    /** 当前筛选的作者还没挂出来时，把他前面的几页补上。 */
+    private void ensureChipBuilt(String author) {
+        if (author == null || author.isEmpty() || chipAuthors == null) {
+            return;
+        }
+        for (int index = chipBuilt; index < chipAuthors.size(); index++) {
+            if (chipAuthors.get(index).name.equals(author)) {
+                while (chipBuilt <= index && chipBuilt < chipAuthors.size()) {
+                    appendChips();
+                }
+                return;
+            }
+        }
+    }
+
+    /** 作者列表只在索引真的变了以后重算；Library.authors 要遍历+排序全库。 */
+    private List<Library.AuthorInfo> cachedAuthors() {
+        int revision = app.store.revision();
+        if (cachedAuthors == null || cachedAuthorsRevision != revision
+                || cachedAuthorsSize != allWorks.size()) {
+            cachedAuthors = Library.authors(allWorks);
+            cachedAuthorsRevision = revision;
+            cachedAuthorsSize = allWorks.size();
+        }
+        return cachedAuthors;
+    }
+
+    private static long authorHash(List<Library.AuthorInfo> authors) {
+        long hash = 17L;
+        for (Library.AuthorInfo info : authors) {
+            hash = hash * 31L + info.name.hashCode();
+            hash = hash * 31L + info.count;
+        }
+        return hash;
     }
 
     /** 只统计当前片库里确实还能本地播放的作品，避免旧路径下载数虚高。 */
@@ -512,13 +631,28 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
         return count;
     }
 
-    private void addOfflineChip() {
+    private int cachedOfflineCacheSize = -1;
+
+    private int cachedOfflineCount() {
+        int revision = app.store.revision();
+        if (offlineDirty || cachedOfflineRevision != revision
+                || cachedOfflineCacheSize != allWorks.size() || cachedOfflineCount < 0) {
+            cachedOfflineCount = offlineCount();
+            cachedOfflineRevision = revision;
+            cachedOfflineCacheSize = allWorks.size();
+            offlineDirty = false;
+        }
+        return cachedOfflineCount;
+    }
+
+    private void addOfflineChip(int count) {
         boolean active = offlineOnly;
-        TextView chip = Ui.text(this, "已下载 " + offlineCount(), 12,
+        TextView chip = Ui.text(this, "已下载 " + count, 12,
                 active ? Color.WHITE : Ui.DIM, active);
         chip.setPadding(Ui.dp(this, 12), Ui.dp(this, 7),
                 Ui.dp(this, 12), Ui.dp(this, 7));
         chip.setBackground(Ui.round(this, active ? 0xFF1D4A4A : 0xFF17171C, 14));
+        chip.setTag(new ChipTag("", true, active));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         params.rightMargin = Ui.dp(this, 8);
@@ -529,11 +663,12 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
             if (search != null) {
                 search.setText("");
             }
-            lastChipsAt = 0;
+            offlineDirty = true;
             rebuildDisplayed();
         });
         chipsBox.addView(chip, params);
         chipViews.add(chip);
+        offlineChip = chip;
     }
 
     private void addChip(String label, String author) {
@@ -542,6 +677,7 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
         chip.setPadding(Ui.dp(this, 12), Ui.dp(this, 7),
                 Ui.dp(this, 12), Ui.dp(this, 7));
         chip.setBackground(Ui.round(this, active ? 0xFF2C2C34 : 0xFF17171C, 14));
+        chip.setTag(new ChipTag(author, false, active));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         params.rightMargin = Ui.dp(this, 8);
@@ -552,6 +688,40 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
         });
         chipsBox.addView(chip, params);
         chipViews.add(chip);
+    }
+
+    /** 筛选变化时只改颜色；只有状态真的变了才新建 drawable。 */
+    private void updateChipStyles() {
+        for (TextView chip : chipViews) {
+            Object tag = chip.getTag();
+            if (!(tag instanceof ChipTag)) {
+                continue;
+            }
+            ChipTag info = (ChipTag) tag;
+            boolean active = info.offline
+                    ? offlineOnly
+                    : (!offlineOnly && info.author.equals(filterAuthor));
+            if (active == info.active) {
+                continue;
+            }
+            info.active = active;
+            chip.setTextColor(active ? Color.WHITE : Ui.DIM);
+            int background = active
+                    ? (info.offline ? 0xFF1D4A4A : 0xFF2C2C34) : 0xFF17171C;
+            chip.setBackground(Ui.round(this, background, 14));
+        }
+    }
+
+    private static final class ChipTag {
+        final String author;
+        final boolean offline;
+        boolean active;
+
+        ChipTag(String author, boolean offline, boolean active) {
+            this.author = author;
+            this.offline = offline;
+            this.active = active;
+        }
     }
 
     private void renderStatusIdle() {
@@ -607,9 +777,16 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
 
     /** 随机挑一条视频开始看；片库里没有视频时退回全部作品。 */
     private void randomWatch() {
+        // 筛选中/只看已下载时，随机范围就是眼前这份列表；否则用全库
+        boolean filtered = offlineOnly || !filterAuthor.isEmpty() || !query.isEmpty();
+        List<Work> source = filtered ? displayed : allWorks;
         List<Work> pool = new ArrayList<>();
         List<Work> unknown = new ArrayList<>();
-        for (Work work : allWorks) {
+        for (Work work : source) {
+            if (work.empty) {
+                // 空目录（连图片/视频都没有）随机到只会报错
+                continue;
+            }
             if (work.isVideo()) {
                 pool.add(work);
             } else if (!work.isAlbum()) {
@@ -620,14 +797,15 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
         // 需要把还没读详情的作品也算进来，否则随机池只有已经播放过/下载过的那几十条
         pool.addAll(unknown);
         if (pool.isEmpty()) {
-            for (Work work : allWorks) {
+            for (Work work : source) {
                 if (!work.empty) {
                     pool.add(work);
                 }
             }
         }
         if (pool.isEmpty()) {
-            Ui.toast(this, prefs.hasDav() ? "片库里还没有可播放的作品" : "先连接 WebDAV 片库");
+            Ui.toast(this, filtered ? "当前筛选里没有可播放的作品"
+                    : (prefs.hasDav() ? "片库里还没有可播放的作品" : "先连接 WebDAV 片库"));
             return;
         }
         // 整段打乱：随机观看要的是整段随机顺序，而不是只随机一个起点、
@@ -674,15 +852,18 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
             openSetup();
             return;
         }
-        if (app.scanner.isRunning()) {
-            Ui.toast(this, "正在扫描，请稍候");
+        if (scanning) {
             return;
         }
-        if (scanning) {
+        if (app.scanner.isRunning()) {
+            // 扫描是全局的：上一次扫描还没结束（比如退出后重进、或别的页面起的），
+            // 这里接上去等它结束，否则这次扫描的增量永远不会回到首页。
+            attachToRunningScan();
             return;
         }
         scanning = true;
         lastError = null;
+        handler.removeCallbacks(scanWatcher);
         emptyText.setVisibility(displayed.isEmpty() ? View.VISIBLE : View.GONE);
         emptyText.setText("正在从 WebDAV 拉取片库…");
         emptyAction.setVisibility(View.GONE);
@@ -692,9 +873,48 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
         app.scanner.scan(this);
     }
 
+    /** 扫描进行中时挂上去：只轮询是否结束，结束后重读一次落盘结果。 */
+    private void attachToRunningScan() {
+        scanning = true;
+        lastError = null;
+        if (statusText != null) {
+            statusText.setText("已有扫描在进行，等它结束后刷新片库…");
+        }
+        if (scanProgress != null) {
+            scanProgress.setVisibility(View.VISIBLE);
+            scanProgress.setIndeterminate(true);
+        }
+        handler.removeCallbacks(scanWatcher);
+        handler.postDelayed(scanWatcher, 400L);
+    }
+
+    private final Runnable scanWatcher = new Runnable() {
+        @Override
+        public void run() {
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
+            if (app.scanner.isRunning()) {
+                handler.postDelayed(this, 400L);
+                return;
+            }
+            scanning = false;
+            if (scanProgress != null) {
+                scanProgress.setVisibility(View.GONE);
+            }
+            allWorks.clear();
+            allRels.clear();
+            loadFromStore();
+            refreshCacheBytes();
+        }
+    };
+
     @Override
     public void onPhase(String message) {
         runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
             if (statusText != null) {
                 statusText.setText(message);
             }
@@ -704,6 +924,9 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
     @Override
     public void onProgress(int authorsDone, int authorsTotal, int worksFound) {
         runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
             if (scanProgress != null) {
                 scanProgress.setIndeterminate(false);
                 scanProgress.setMax(Math.max(1, authorsTotal));
@@ -719,6 +942,9 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
     @Override
     public void onBatch(List<Work> works) {
         runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed()) {
+                return;
+            }
             boolean added = false;
             for (Work work : works) {
                 if (allRels.add(work.rel)) {
@@ -729,6 +955,7 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
             if (!added) {
                 return;
             }
+            worksSorted = false;
             handler.removeCallbacks(rebuildRunnable);
             handler.postDelayed(rebuildRunnable, 350L);
         });
@@ -736,6 +963,10 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
 
     @Override
     public void onDone(int works, String error) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        handler.removeCallbacks(scanWatcher);
         scanning = false;
         handler.removeCallbacks(rebuildRunnable);
         if (error != null && !error.isEmpty() && !"已停止扫描".equals(error)) {
@@ -744,7 +975,9 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
         } else {
             lastError = null;
         }
-        if (error == null) {
+        if (error == null || "已停止扫描".equals(error)) {
+            // 正常结束、或用户中途停止：以落盘结果为准。
+            // 停止时扫描线程可能已经 addBatch 了一部分，界面上那份增量不能再留着（点开会 404）。
             allWorks.clear();
             allRels.clear();
             for (Work work : app.store.works()) {
@@ -752,8 +985,10 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
                     allWorks.add(work);
                 }
             }
+            worksSorted = true;
         }
         cachedStats = null;   // 扫描结束，统计必须是最新的一份
+        offlineDirty = true;   // 扫描结束，已下载数量按新片库重算
         rebuildDisplayed();
         refreshCacheBytes();
         if (scanProgress != null) {
@@ -771,7 +1006,7 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
                 if (adapter != null) {
                     adapter.notifyDataSetChanged();
                 }
-                lastChipsAt = 0;
+                offlineDirty = true;
                 renderChips();
                 renderStats();
                 if (offlineOnly) {
@@ -809,7 +1044,7 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
                         app.offline.delete(work);
                         Ui.toast(this, "已删除本地文件");
                         adapter.notifyDataSetChanged();
-                        lastChipsAt = 0;
+                        offlineDirty = true;
                         renderChips();
                         renderStats();
                         if (offlineOnly) {
@@ -872,7 +1107,7 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
         allRels.remove(work.rel);
         allWorks.remove(work);
         cachedStats = null;
-        lastChipsAt = 0;
+        offlineDirty = true;
         rebuildDisplayed();
         refreshCacheBytes();
     }
@@ -900,8 +1135,9 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
     protected void onResume() {
         super.onResume();
         app.offline.addListener(offlineListener);
-        // 在作者主页/播放页删掉作品后返回，本地索引已经变了，重新读一次
-        if (!scanning && app.store.isLoaded() && app.store.size() != allWorks.size()) {
+        // 在作者主页/播放页删掉作品后返回，本地索引已经变了，重新读一次。
+        // 用 revision 而不是数量：删一条又补一条时数量相同，但内容已经不同了。
+        if (!scanning && app.store.isLoaded() && app.store.revision() != lastRevision) {
             loadFromStore();
         }
         if (list != null) {
@@ -920,6 +1156,8 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
     protected void onDestroy() {
         handler.removeCallbacks(loadWatcher);
         handler.removeCallbacks(rebuildRunnable);
+        handler.removeCallbacks(searchRunnable);
+        handler.removeCallbacks(scanWatcher);
         handler.removeCallbacksAndMessages(null);
         super.onDestroy();
     }
@@ -990,6 +1228,9 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
         final TextView title;
         final TextView badge;
         final TextView offlineBadge;
+        /** 两种状态底色只建一次：每次 bind 都 Ui.round 会在滚动时堆垃圾。 */
+        final GradientDrawable savedBadgeBg;
+        final GradientDrawable downloadingBadgeBg;
         int index = -1;
 
         Cell() {
@@ -1038,7 +1279,9 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
             addView(badge, badgeParams);
 
             offlineBadge = Ui.text(HomeActivity.this, "已下载", 9, Color.WHITE, true);
-            offlineBadge.setBackground(Ui.round(HomeActivity.this, 0xCC0E7C86, 7));
+            savedBadgeBg = Ui.round(HomeActivity.this, 0xCC0E7C86, 7);
+            downloadingBadgeBg = Ui.round(HomeActivity.this, 0xCC9A5B00, 7);
+            offlineBadge.setBackground(savedBadgeBg);
             offlineBadge.setPadding(Ui.dp(HomeActivity.this, 5), Ui.dp(HomeActivity.this, 2),
                     Ui.dp(HomeActivity.this, 5), Ui.dp(HomeActivity.this, 2));
             offlineBadge.setVisibility(View.GONE);
@@ -1073,17 +1316,21 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
             } else if (work.isVideo()) {
                 badge.setText("视频");
                 badge.setVisibility(View.VISIBLE);
+            } else if (work.isArchive()) {
+                // 作品包：类型要等打开时读 tar 头才知道，先给个中性角标
+                badge.setText("作品");
+                badge.setVisibility(View.VISIBLE);
             } else {
                 badge.setVisibility(View.GONE);
             }
             if (app.offline.has(work)) {
                 offlineBadge.setText("已下载");
-                offlineBadge.setBackground(Ui.round(HomeActivity.this, 0xCC0E7C86, 7));
+                offlineBadge.setBackground(savedBadgeBg);
                 offlineBadge.setVisibility(View.VISIBLE);
             } else if (app.offline.isDownloading(work)) {
                 int percent = Math.max(0, app.offline.progressOf(work));
                 offlineBadge.setText("下载中 " + percent + "%");
-                offlineBadge.setBackground(Ui.round(HomeActivity.this, 0xCC9A5B00, 7));
+                offlineBadge.setBackground(downloadingBadgeBg);
                 offlineBadge.setVisibility(View.VISIBLE);
             } else {
                 offlineBadge.setVisibility(View.GONE);

@@ -165,6 +165,7 @@ public final class TrashActivity extends Activity {
                 return;
             }
             if (!result.ok || work == null) {
+                android.util.Log.w("JYWatch", "trash preview failed: " + result.error);
                 Ui.toast(this, result.error == null ? "打不开这个作品" : result.error);
                 return;
             }
@@ -212,11 +213,25 @@ public final class TrashActivity extends Activity {
             }
             return;
         }
+        // 一次批量合并：以前每条都 store.update()，恢复一个 500 条作品的作者
+        // 就是 500 次线性查找 + 500 次全量排序 + 反复触发整库 JSON 落盘
+        java.util.List<Work> restored = new ArrayList<>();
         for (String rel : item.rels) {
             String authorRel = parentOf(rel);
             String[] author = Work.splitAuthor(RemoteFile.baseName(authorRel));
-            app.store.update(Work.skeleton(rel, authorRel, author[0], author[1],
-                    RemoteFile.baseName(rel), 0L));
+            String name = RemoteFile.baseName(rel);
+            if (TarReader.looksLikeTar(name)) {
+                // 恢复的是作品包：必须按 archive 骨架加回去，否则会被当成散目录，
+                // 打开时 PROPFIND 一个文件、什么也读不出来
+                restored.add(Work.archiveSkeleton(rel, authorRel, author[0], author[1],
+                        name, 0L, 0L));
+            } else {
+                restored.add(Work.skeleton(rel, authorRel, author[0], author[1],
+                        name, 0L));
+            }
+        }
+        if (!restored.isEmpty()) {
+            app.store.addBatch(restored);
         }
     }
 

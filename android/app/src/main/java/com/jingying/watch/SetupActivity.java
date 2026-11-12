@@ -191,6 +191,21 @@ public final class SetupActivity extends Activity {
         coverParams.leftMargin = Ui.dp(this, 10);
         cacheActions.addView(clearCovers, coverParams);
 
+        LinearLayout archiveRow = new LinearLayout(this);
+        archiveRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams archiveRowParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        archiveRowParams.topMargin = Ui.dp(this, 10);
+        content.addView(archiveRow, archiveRowParams);
+
+        TextView clearArchive = actionButton("清空解包缓存（作品包）", false);
+        clearArchive.setOnClickListener(view -> {
+            app.archives.clearAll();
+            loadCacheInfo();
+            Ui.toast(this, "解包缓存已清空");
+        });
+        archiveRow.addView(clearArchive, new LinearLayout.LayoutParams(0, Ui.dp(this, 42), 1f));
+
         // 本地下载
         View divider2 = new View(this);
         divider2.setBackgroundColor(Ui.LINE);
@@ -333,6 +348,7 @@ public final class SetupActivity extends Activity {
     private void loadCacheInfo() {
         app.io.execute(() -> {
             long media = app.proxy.cacheBytes();
+            long archive = app.archives == null ? 0L : app.archives.cacheBytes();
             long covers = 0;
             java.io.File dir = new java.io.File(getFilesDir(), "covers");
             java.io.File[] files = dir.listFiles();
@@ -342,10 +358,17 @@ public final class SetupActivity extends Activity {
                 }
             }
             final long mediaBytes = media;
+            final long archiveBytes = archive;
             final long coverBytes = covers;
-            runOnUiThread(() -> cacheText.setText("视频缓存 " + Util.humanSize(mediaBytes)
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
+                cacheText.setText("视频缓存 " + Util.humanSize(mediaBytes)
                     + "   ·   封面 " + Util.humanSize(coverBytes)
-                    + "   ·   上限 " + prefs.cacheMb() + " MB"));
+                    + "   ·   解包 " + Util.humanSize(archiveBytes)
+                    + "   ·   上限 " + prefs.cacheMb() + " MB");
+            });
         });
     }
 
@@ -400,6 +423,9 @@ public final class SetupActivity extends Activity {
             final boolean success = ok;
             final String result = message;
             runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
                 statusText.setText(result);
                 statusText.setTextColor(success ? 0xFF7FD8FF : Ui.ACCENT);
                 testButton.setEnabled(true);

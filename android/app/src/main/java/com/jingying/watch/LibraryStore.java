@@ -198,6 +198,18 @@ public final class LibraryStore {
         Map<String, Work> merged = new HashMap<>(Math.max(16, byRel.size() + items.size()));
         merged.putAll(byRel);
         for (Work work : items) {
+            if (work == null || work.rel == null || work.rel.isEmpty()) {
+                continue;
+            }
+            Work existing = byRel.get(work.rel);
+            if (existing != null && existing != work && existing.detailsLoaded
+                    && !existing.empty && !work.detailsLoaded) {
+                // 扫描拿到的只是骨架：并进已有对象，别把详情/文案/音乐/封面一起冲掉。
+                // 用同一个对象还能让播放页、收藏页手里那份列表跟着更新。
+                existing.mergeSkeleton(work);
+                merged.put(work.rel, existing);
+                continue;
+            }
             merged.put(work.rel, work);
         }
         works.clear();
@@ -369,6 +381,7 @@ public final class LibraryStore {
 
     /** 后台线程循环落盘：先在锁里拷贝快照，再在锁外序列化，主线程不会被 8MB JSON 卡住。 */
     private void drainSaves() {
+        int writeFailures = 0;
         try {
             while (true) {
                 synchronized (this) {
@@ -393,7 +406,21 @@ public final class LibraryStore {
                     snapshot = new Snapshot(new ArrayList<>(works), videoRoot, musicRoot,
                             authorRoot, scannedAt, new HashMap<>(authorMtimes));
                 }
-                writeAtomically(toJson(snapshot).toString());
+                if (!writeAtomically(toJson(snapshot).toString())) {
+                    // 写失败（磁盘满/权限）：恢复 dirty 并退避重试，别静默丢掉这次更新
+                    synchronized (this) {
+                        dirty = true;
+                    }
+                    if (++writeFailures >= 5) {
+                        synchronized (this) {
+                            saving = false;
+                        }
+                        return;
+                    }
+                    Thread.sleep(SAVE_DEBOUNCE_MS * (long) Math.min(writeFailures, 4));
+                } else {
+                    writeFailures = 0;
+                }
             }
         } catch (Throwable ignored) {
             // 序列化失败（比如内存不足）也要把写线程放出来，否则后面再也不落盘
@@ -415,7 +442,12 @@ public final class LibraryStore {
             snapshot = new Snapshot(new ArrayList<>(works), videoRoot, musicRoot,
                     authorRoot, scannedAt, new HashMap<>(authorMtimes));
         }
-        writeAtomically(toJson(snapshot).toString());
+        if (!writeAtomically(toJson(snapshot).toString())) {
+            // 同步保存失败也要留着 dirty，等下一次 saveAsync 重试
+            synchronized (this) {
+                dirty = true;
+            }
+        }
     }
 
     private static final class Snapshot {
@@ -460,18 +492,25 @@ public final class LibraryStore {
         return json;
     }
 
-    private void writeAtomically(String text) {
+    /** 返回 true 才算写成功；失败要告诉调用方恢复 dirty，否则这次索引更新会永久丢。 */
+    private boolean writeAtomically(String text) {
         synchronized (writeLock) {
             File temp = new File(file.getParentFile(), "library.json.tmp");
             try (FileOutputStream output = new FileOutputStream(temp)) {
                 OutputStreamWriter writer = new OutputStreamWriter(output, Charset.forName("UTF-8"));
                 writer.write(text);
                 writer.flush();
-            } catch (Exception ignored) {
-                return;
+            } catch (Exception exc) {
+                android.util.Log.w("JYWatch", "写片库索引失败", exc);
+                return false;
             }
-            //noinspection ResultOfMethodCallIgnored
-            temp.renameTo(file);
+            if (!temp.renameTo(file)) {
+                //noinspection ResultOfMethodCallIgnored
+                temp.delete();
+                android.util.Log.w("JYWatch", "片库索引重命名失败");
+                return false;
+            }
+            return true;
         }
     }
 }

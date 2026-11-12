@@ -75,8 +75,9 @@ final class HttpLite {
         URL current = url;
         String currentMethod = method;
         byte[] currentPayload = payload;
+        Map<String, String> headers = extraHeaders;
         for (int redirect = 0; redirect < 6; redirect++) {
-            Response response = requestOnce(currentMethod, current, extraHeaders,
+            Response response = requestOnce(currentMethod, current, headers,
                     currentPayload, connectTimeout, readTimeout, sslContext, insecure);
             int status = response.status;
             if (status == 301 || status == 302 || status == 303
@@ -86,7 +87,31 @@ final class HttpLite {
                 if (location == null || location.isEmpty()) {
                     throw new IOException("服务器重定向却没有 Location");
                 }
-                current = new URL(current, location);
+                URL next;
+                try {
+                    next = new URL(current, location);
+                } catch (Exception exc) {
+                    throw new IOException("服务器重定向地址不合法：" + location);
+                }
+                // https 被降级成 http 时，Basic 凭据会明文上网，直接拒绝
+                if ("https".equalsIgnoreCase(current.getProtocol())
+                        && !"https".equalsIgnoreCase(next.getProtocol())) {
+                    throw new IOException("重定向把 HTTPS 降级成了 HTTP，已阻止");
+                }
+                // 跨主机时丢掉凭据和 WebDAV 的 Destination，别把它们送给第三方
+                if (!sameOrigin(current, next) && headers != null) {
+                    Map<String, String> stripped = new LinkedHashMap<>();
+                    for (Map.Entry<String, String> entry : headers.entrySet()) {
+                        String name = entry.getKey();
+                        if (name == null || name.equalsIgnoreCase("Authorization")
+                                || name.equalsIgnoreCase("Destination")) {
+                            continue;
+                        }
+                        stripped.put(name, entry.getValue());
+                    }
+                    headers = stripped;
+                }
+                current = next;
                 if (status == 303) {
                     currentMethod = "GET";
                     currentPayload = null;
@@ -96,6 +121,17 @@ final class HttpLite {
             return response;
         }
         throw new IOException("重定向次数过多");
+    }
+
+    /** 协议 + 主机 + 端口完全一致才算同源（默认端口要补上再比）。 */
+    private static boolean sameOrigin(URL a, URL b) {
+        int portA = a.getPort() > 0 ? a.getPort()
+                : ("https".equalsIgnoreCase(a.getProtocol()) ? 443 : 80);
+        int portB = b.getPort() > 0 ? b.getPort()
+                : ("https".equalsIgnoreCase(b.getProtocol()) ? 443 : 80);
+        return a.getProtocol().equalsIgnoreCase(b.getProtocol())
+                && a.getHost().equalsIgnoreCase(b.getHost())
+                && portA == portB;
     }
 
     private static Response requestOnce(String method, URL url,

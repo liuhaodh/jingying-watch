@@ -47,8 +47,15 @@ public final class AvatarStore {
     private final Map<String, List<String>> byNick = new HashMap<>();
     private final Map<String, String> secByUid = new HashMap<>();
     private final Map<String, String> secByNick = new HashMap<>();
-    /** 主线程取缓存、下载线程写缓存，必须是并发容器。 */
-    private final Map<String, Bitmap> memory = new ConcurrentHashMap<>();
+    /**
+     * 头像内存缓存。以前是无上限的 ConcurrentHashMap：片库几千位作者全看过一遍
+     * 就一直占着内存。头像只有几十 KB，给 8MB 的上限足够，LRU 自动回收。
+     * android.util.LruCache 的方法本身是同步的，主线程取、下载线程写都安全。
+     */
+    private final android.util.LruCache<String, Bitmap> memory;
+    /** 找不到头像的作者记一笔，短期内别再为同一个 key 重复联网。 */
+    private final Map<String, Long> failedAt = new ConcurrentHashMap<>();
+    private static final long FAIL_TTL_MS = 10 * 60 * 1000L;
     /** 同一张头像正在下载时，后来的请求挂在这里等结果，不能直接丢掉。 */
     private final Map<String, List<Callback>> pending = new HashMap<>();
     private final Object pendingLock = new Object();
@@ -62,6 +69,10 @@ public final class AvatarStore {
         }
     });
     private volatile boolean indexReady;
+    /** 有一个线程正在联网拉 authors.json（联网本身在锁外）。 */
+    private volatile boolean indexLoading;
+    /** 联网失败后的退避时间点。 */
+    private volatile long nextIndexRetryAt;
     private volatile String root = "净影/作者资料";
 
     public AvatarStore(App app) {
@@ -71,6 +82,13 @@ public final class AvatarStore {
             //noinspection ResultOfMethodCallIgnored
             dir.mkdirs();
         }
+        int maxKb = (int) Math.min(8 * 1024, Runtime.getRuntime().maxMemory() / 1024 / 32);
+        memory = new android.util.LruCache<String, Bitmap>(Math.max(1024, maxKb)) {
+            @Override
+            protected int sizeOf(String key, Bitmap value) {
+                return value.getByteCount() / 1024;
+            }
+        };
     }
 
     public void setRoot(String authorRoot) {
@@ -90,7 +108,8 @@ public final class AvatarStore {
             byNick.clear();
             secByUid.clear();
             secByNick.clear();
-            memory.clear();
+            memory.evictAll();
+            failedAt.clear();
             indexReady = false;
         }
         //noinspection ResultOfMethodCallIgnored
@@ -105,8 +124,14 @@ public final class AvatarStore {
                 byNick.clear();
                 secByUid.clear();
                 secByNick.clear();
+                failedAt.clear();
                 indexReady = false;
+                nextIndexRetryAt = 0L;
             }
+            // 本地缓存必须一起删：ensureIndex 会先读 authors.json，
+            // 只要读到旧文件就不会再联网，「重新扫描作者资料」等于什么都没做
+            //noinspection ResultOfMethodCallIgnored
+            new File(dir, "authors.json").delete();
             ensureIndex();
         });
     }
@@ -122,6 +147,15 @@ public final class AvatarStore {
         if (cached != null) {
             app.runOnMain(() -> callback.onAvatar(author, uid, cached));
             return;
+        }
+        Long failed = failedAt.get(key);
+        if (failed != null) {
+            if (System.currentTimeMillis() - failed < FAIL_TTL_MS) {
+                // 刚试过、找不到：直接回落成首字，别再把唯一一条头像线程堵在这
+                app.runOnMain(() -> callback.onAvatar(author, uid, null));
+                return;
+            }
+            failedAt.remove(key);
         }
         if (!subscribe(key, callback)) {
             return;
@@ -149,6 +183,14 @@ public final class AvatarStore {
                 }
                 if (bitmap != null) {
                     save(bitmap, new File(dir, key + ".jpg"));
+                    failedAt.remove(key);
+                } else if (indexReady) {
+                    // 只有「确实查过作者资料」才记负缓存；索引都还没读到就别记，
+                    // 否则网络慢一点就会把这位作者的头像封 10 分钟
+                    if (failedAt.size() > 4096) {
+                        failedAt.clear();
+                    }
+                    failedAt.put(key, System.currentTimeMillis());
                 }
             } catch (Throwable ignored) {
             }
@@ -201,9 +243,21 @@ public final class AvatarStore {
     }
 
     // ---------- 索引 ----------
+    /**
+     * 读作者资料：先用本地 authors.json，没有才联网。
+     * 联网这一段刻意放在锁外——以前整段都攥着 lock，主线程上的 cachedSecUid
+     * 会跟着等一次最长 40 秒的网络读，点「打开抖音主页」就卡成 ANR。
+     */
     private void ensureIndex() {
+        if (indexReady) {
+            return;
+        }
         synchronized (lock) {
             if (indexReady) {
+                return;
+            }
+            if (System.currentTimeMillis() < nextIndexRetryAt) {
+                // 上次联网失败，退避 60 秒再来，别每个头像请求都重打一次
                 return;
             }
             if (byUid.isEmpty() && byNick.isEmpty()) {
@@ -214,18 +268,57 @@ public final class AvatarStore {
                     } catch (Exception ignored) {
                     }
                 }
-                if (byUid.isEmpty() && byNick.isEmpty()) {
+            }
+            if (!byUid.isEmpty() || !byNick.isEmpty()) {
+                indexReady = true;
+                return;
+            }
+            if (indexLoading) {
+                // 已经有线程在联网：不持锁干等，最多等 5 秒拿它的结果
+                long deadline = System.currentTimeMillis() + 5000L;
+                while (indexLoading && !indexReady && System.currentTimeMillis() < deadline) {
                     try {
-                        String rel = root + "/authors.json";
-                        byte[] bytes = app.proxy.readAll(rel, "authors.json", 0, 40000);
-                        String text = new String(bytes, Charset.forName("UTF-8"));
+                        lock.wait(100L);
+                    } catch (InterruptedException exc) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                return;
+            }
+            indexLoading = true;
+        }
+
+        String text = null;
+        try {
+            String rel = root + "/authors.json";
+            byte[] bytes = app.proxy.readAll(rel, "authors.json", 0, 40000);
+            text = new String(bytes, Charset.forName("UTF-8"));
+        } catch (Exception ignored) {
+        } finally {
+            synchronized (lock) {
+                if (text != null) {
+                    byUid.clear();
+                    byNick.clear();
+                    secByUid.clear();
+                    secByNick.clear();
+                    try {
                         parse(text);
-                        writeText(cache, text);
                     } catch (Exception ignored) {
                     }
                 }
+                indexLoading = false;
+                if (text != null) {
+                    indexReady = true;
+                } else {
+                    // 拉失败了：留个退避时间，下次请求过一会儿再试
+                    nextIndexRetryAt = System.currentTimeMillis() + 60000L;
+                }
+                lock.notifyAll();
             }
-            indexReady = true;
+        }
+        if (text != null) {
+            writeText(new File(dir, "authors.json"), text);
         }
     }
 
@@ -438,10 +531,25 @@ public final class AvatarStore {
 
     // ---------- 文件 ----------
     private static Bitmap decodeFile(File file) {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(file.getAbsolutePath(), bounds);
+        if (bounds.outWidth <= 0) {
+            return null;
+        }
         BitmapFactory.Options options = new BitmapFactory.Options();
-        options.inSampleSize = 2;
+        // 和 decodeBytes 用同一套取样规则：否则同一张头像「本次会话清晰、重启后糊一半」
+        options.inSampleSize = avatarSample(bounds.outWidth, bounds.outHeight);
         options.inPreferredConfig = Bitmap.Config.RGB_565;
         return BitmapFactory.decodeFile(file.getAbsolutePath(), options);
+    }
+
+    private static int avatarSample(int width, int height) {
+        int sample = 1;
+        while (Math.max(width, height) / (sample * 2) >= 160) {
+            sample *= 2;
+        }
+        return sample;
     }
 
     private static Bitmap decodeBytes(byte[] bytes) {
@@ -454,12 +562,8 @@ public final class AvatarStore {
         if (bounds.outWidth <= 0) {
             return null;
         }
-        int sample = 1;
-        while (Math.max(bounds.outWidth, bounds.outHeight) / (sample * 2) >= 160) {
-            sample *= 2;
-        }
         BitmapFactory.Options options = new BitmapFactory.Options();
-        options.inSampleSize = sample;
+        options.inSampleSize = avatarSample(bounds.outWidth, bounds.outHeight);
         options.inPreferredConfig = Bitmap.Config.RGB_565;
         return BitmapFactory.decodeByteArray(bytes, 0, bytes.length, options);
     }

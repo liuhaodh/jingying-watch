@@ -268,6 +268,7 @@ public final class TrashStore {
             }
         } catch (DavClient.DavException exc) {
             // 已经搬进去的部分要搬回原位，不能把人家的目录留在回收站里
+            boolean rolledBack = true;
             for (int index = 0; index < targets.size(); index++) {
                 try {
                     String moved = itemRel + "/" + slot("data", index + 1);
@@ -275,7 +276,14 @@ public final class TrashStore {
                         dav.move(moved, targets.get(index), false);
                     }
                 } catch (Exception ignored) {
+                    rolledBack = false;
                 }
+            }
+            if (!rolledBack) {
+                // 回滚本身也失败了：回收站里可能还留着用户目录，
+                // 这时候再 deleteTree 就是真的删数据了，宁可报错让人工处理
+                throw new DavClient.DavException("移动失败，而且回滚也没完成；"
+                        + "请到回收站里手动恢复「" + item.name + "」");
             }
             try {
                 dav.deleteTree(itemRel);
@@ -359,6 +367,17 @@ public final class TrashStore {
         String dataRel = item.trashRel + "/data";
         String workName = item.name;
         String authorRel = parentOf(item.originalRel());
+        String[] authorInfo = Work.splitAuthor(RemoteFile.baseName(authorRel));
+        if ("work".equals(item.type) && TarReader.looksLikeTar(item.name)) {
+            // 作品包在回收站里就是一个 data 文件，按 tar 头预览
+            long size = 0L;
+            try {
+                size = dav.sizeOf(dataRel);
+            } catch (Exception ignored) {
+            }
+            return loadArchivePreview(dav, dataRel, item.name, authorRel,
+                    authorInfo[0], authorInfo[1], size);
+        }
         List<RemoteFile> files = new ArrayList<>();
         List<DavEntry> entries = dav.propfind(dataRel, 1);
         for (DavEntry entry : entries) {
@@ -382,6 +401,17 @@ public final class TrashStore {
                     }
                 }
                 break;
+            }
+            if (files.isEmpty()) {
+                // 作者目录下只有作品包
+                for (DavEntry entry : entries) {
+                    if (entry.dir || !TarReader.looksLikeTar(entry.name)) {
+                        continue;
+                    }
+                    String[] author = Work.splitAuthor(RemoteFile.baseName(item.originalRel()));
+                    return loadArchivePreview(dav, entry.rel, entry.name,
+                            item.originalRel(), author[0], author[1], entry.size);
+                }
             }
         }
         if (files.isEmpty()) {
@@ -413,6 +443,52 @@ public final class TrashStore {
         // 详情已经拼好了，别再让播放页去 PROPFIND（那会把回收站的路径写进片库索引）
         work.detailsLoaded = true;
         return work;
+    }
+
+    /** 回收站里的作品包预览：按 tar 头列成员，读包里的文案，但不写回片库索引。 */
+    private Work loadArchivePreview(DavClient dav, String rel, String tarName,
+                                    String authorRel, String authorName, String uniqueId,
+                                    long size) throws DavClient.DavException {
+        Work work = Work.archiveSkeleton(rel, authorRel, authorName, uniqueId,
+                tarName, size, 0L);
+        try {
+            List<TarReader.Member> members;
+            TarReader.Source source = new DavTarSource(dav, rel, size);
+            try {
+                members = TarReader.list(source);
+            } finally {
+                source.close();
+            }
+            Work detail = Work.fromArchive(work, members);
+            if (detail == null) {
+                throw new DavClient.DavException("回收站里这个作品包没有可播放的内容");
+            }
+            work.mergeArchiveDetails(detail);
+            for (TarReader.Member member : members) {
+                if (!"文案.txt".equals(member.name)) {
+                    continue;
+                }
+                TarReader.Source captionSource = new DavTarSource(dav, rel, size);
+                try {
+                    String text = TarReader.readText(captionSource, member, 20000);
+                    if (text != null && !text.isEmpty()) {
+                        Work.parseCaptionText(work, text);
+                    }
+                } finally {
+                    captionSource.close();
+                }
+                break;
+            }
+            work.musicChecked = true;
+            work.detailsLoaded = true;
+            return work;
+        } catch (DavClient.DavException exc) {
+            throw exc;
+        } catch (Exception exc) {
+            android.util.Log.w("JYWatch", "trash archive preview failed " + rel, exc);
+            throw new DavClient.DavException("读取回收站作品包失败："
+                    + (exc.getMessage() == null ? "格式不支持" : exc.getMessage()));
+        }
     }
 
     public void loadWorkAsync(Item item, WorkCallback callback) {
@@ -449,23 +525,49 @@ public final class TrashStore {
                 throw new DavClient.DavException("原位置已有同名目录：" + rel);
             }
         }
-        for (int index = 0; index < item.rels.size(); index++) {
-            int number = index + 1;
-            String rel = item.rels.get(index);
-            String dataSlot = item.trashRel + "/" + slot("data", number);
-            if (!dav.exists(dataSlot)) {
-                continue;
-            }
-            dav.mkcolPath(parentOf(rel));
-            dav.move(dataSlot, rel, false);
-            String music = index < item.musicRels.size() ? item.musicRels.get(index) : "";
-            if (music != null && !music.isEmpty()) {
-                String musicSlot = item.trashRel + "/" + slot("music", number);
-                if (dav.exists(musicSlot) && !dav.exists(music)) {
-                    dav.mkcolPath(parentOf(music));
-                    dav.move(musicSlot, music, false);
+        int moved = 0;
+        try {
+            for (int index = 0; index < item.rels.size(); index++) {
+                int number = index + 1;
+                String rel = item.rels.get(index);
+                String dataSlot = item.trashRel + "/" + slot("data", number);
+                if (!dav.exists(dataSlot)) {
+                    continue;
+                }
+                dav.mkcolPath(parentOf(rel));
+                dav.move(dataSlot, rel, false);
+                moved = number;
+                String music = index < item.musicRels.size() ? item.musicRels.get(index) : "";
+                if (music != null && !music.isEmpty()) {
+                    String musicSlot = item.trashRel + "/" + slot("music", number);
+                    if (dav.exists(musicSlot) && !dav.exists(music)) {
+                        dav.mkcolPath(parentOf(music));
+                        dav.move(musicSlot, music, false);
+                    }
                 }
             }
+        } catch (DavClient.DavException exc) {
+            // 中途失败要搬回回收站：留着「一半恢复、一半在回收站」的状态，
+            // 下次再点恢复会因为「原位置已有同名目录」永远恢复不了
+            for (int index = 0; index < moved; index++) {
+                int number = index + 1;
+                String rel = item.rels.get(index);
+                String dataSlot = item.trashRel + "/" + slot("data", number);
+                try {
+                    if (dav.exists(rel) && !dav.exists(dataSlot)) {
+                        dav.move(rel, dataSlot, false);
+                    }
+                    String music = index < item.musicRels.size() ? item.musicRels.get(index) : "";
+                    if (music != null && !music.isEmpty()) {
+                        String musicSlot = item.trashRel + "/" + slot("music", number);
+                        if (dav.exists(music) && !dav.exists(musicSlot)) {
+                            dav.move(music, musicSlot, false);
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+            throw exc;
         }
         try {
             dav.deleteTree(item.trashRel);

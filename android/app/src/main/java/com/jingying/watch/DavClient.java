@@ -102,8 +102,12 @@ public final class DavClient {
         StringBuilder path = new StringBuilder(basePath == null ? "" : basePath);
         if (rel != null && !rel.isEmpty()) {
             for (String part : rel.split("/")) {
-                if (part.isEmpty()) {
+                if (part.isEmpty() || ".".equals(part)) {
                     continue;
+                }
+                // 服务端 href 里混进 .. 会越过 basePath 操作别的目录，宁可让这次请求失败
+                if ("..".equals(part)) {
+                    throw new IllegalArgumentException("WebDAV 路径包含非法段：" + rel);
                 }
                 if (path.length() == 0 || path.charAt(path.length() - 1) != '/') {
                     path.append('/');
@@ -147,6 +151,12 @@ public final class DavClient {
         try {
             value = URLDecoder.decode(value, "UTF-8");
         } catch (Exception ignored) {
+        }
+        // href 里出现 .. 一律当成脏数据丢掉，别让它进索引、再被 urlFor 拼成越界路径
+        for (String part : value.split("/")) {
+            if ("..".equals(part)) {
+                return "";
+            }
         }
         if (!value.startsWith("/")) {
             value = "/" + value;
@@ -722,10 +732,18 @@ public final class DavClient {
 
         @Override
         public void close() {
-            if (source != null) {
-                try {
-                    source.close();
-                } catch (Exception ignored) {
+            // 先把响应流关掉，再断开连接；只 disconnect 不保证归还流和连接资源
+            try {
+                if (stream != null) {
+                    stream.close();
+                }
+            } catch (Exception ignored) {
+            } finally {
+                if (source != null) {
+                    try {
+                        source.close();
+                    } catch (Exception ignored) {
+                    }
                 }
             }
         }

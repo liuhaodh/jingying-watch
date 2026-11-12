@@ -3,7 +3,6 @@ package com.jingying.watch;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.SystemClock;
 import android.view.MotionEvent;
 import android.view.VelocityTracker;
 import android.view.View;
@@ -16,7 +15,7 @@ import java.util.List;
 
 /**
  * 抖音式上下翻页：三屏（上一屏 / 当前 / 下一屏）跟着手指走，
- * 松手按距离和速度吸附到上一屏/下一屏；单击暂停、双击点赞、长按 2 倍速、
+ * 松手按距离和速度吸附到上一屏/下一屏；单击暂停、双击收藏、长按 2 倍速、
  * 底部进度条可拖动，图集左右滑切换图片。
  */
 public final class FeedPager extends ViewGroup {
@@ -60,11 +59,15 @@ public final class FeedPager extends ViewGroup {
     private volatile long lastTouchAt;
     private float scrubFraction;
     private final int touchSlop;
+    /** 双击窗口：比系统 300ms 略短，单击暂停不至于明显发钝。 */
+    private static final int DOUBLE_TAP_TIMEOUT_MS = 260;
+    private final int doubleTapSlop;
     private final float density;
-
+    private Runnable pendingSingleTap;
+    private long lastTapTime;
     private float lastTapX;
     private float lastTapY;
-    private long lastTapTime;
+
     private final Runnable longPressRunnable;
 
     public FeedPager(Context context) {
@@ -72,6 +75,7 @@ public final class FeedPager extends ViewGroup {
         app = (App) context.getApplicationContext();
         density = getResources().getDisplayMetrics().density;
         touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
+        doubleTapSlop = ViewConfiguration.get(context).getScaledDoubleTapSlop();
         scroller = new OverScroller(context);
         velocityTracker = VelocityTracker.obtain();
         setBackgroundColor(0xFF000000);
@@ -189,6 +193,8 @@ public final class FeedPager extends ViewGroup {
     }
 
     private void bindSlots() {
+        // 翻页 / 换列表时，上一次待判定的单击不能落到新作品上
+        cancelPendingSingleTap();
         for (int index = 0; index < 3; index++) {
             int itemIndex = position + index - 1;
             FeedPage page = pages[index];
@@ -311,6 +317,35 @@ public final class FeedPager extends ViewGroup {
         postInvalidateOnAnimation();
     }
 
+    /**
+     * 手指按下时给还没走完的吸附动画收尾。
+     * 动画走了一半以上就落定到目标页，否则弹回当前页；两种情况都把 offset 归零，
+     * 免得 computeScroll 在手指按着的时候又跳一次页。
+     */
+    private void finishSettleOnTouchDown() {
+        scroller.abortAnimation();
+        int height = getHeight();
+        boolean commit = settleTarget >= 0 && settleTarget != position
+                && height > 0 && Math.abs(offset) > height * 0.5f;
+        if (commit) {
+            int delta = settleTarget - position;
+            position = settleTarget;
+            if (delta > 0) {
+                rotate(true);
+            } else {
+                rotate(false);
+            }
+            bindSlots();
+            if (listener != null) {
+                listener.onPageChanged(position, currentPage().work());
+            }
+        }
+        settleTarget = -1;
+        settling = false;
+        offset = 0;
+        applyOffset();
+    }
+
     private void settle(float velocityY) {
         int height = getHeight();
         if (height <= 0) {
@@ -411,6 +446,11 @@ public final class FeedPager extends ViewGroup {
                 albumSwipe = false;
                 horizontalGesture = false;
                 multiTouch = false;
+                // 上一次吸附动画还没走完就又按下：先把这次翻页收尾再确认「当前页」，
+                // 否则计算下一帧时 computeScroll 会在手指下面直接跳到目标页。
+                if (settling) {
+                    finishSettleOnTouchDown();
+                }
                 FeedPage downPage = currentPage();
                 if (downPage != null) {
                     downPage.onAlbumTouchDown();
@@ -419,14 +459,23 @@ public final class FeedPager extends ViewGroup {
                 // 上一次图集左右滑留下的「别当点击」标记必须清掉，
                 // 否则滑完图集后的第一次点击会被吞掉
                 suppressTapUntilUp = false;
-                if (settling) {
-                    scroller.abortAnimation();
+                // 进度条上按住是在拖动进度，不能同时触发 2× 长按
+                boolean onProgress = downPage != null && downPage.isScrubbable()
+                        && downPage.isInProgressTouchZone(downY);
+                if (!onProgress) {
+                    handler.postDelayed(longPressRunnable, 420);
                 }
-                handler.postDelayed(longPressRunnable, 420);
                 return true;
             case MotionEvent.ACTION_POINTER_DOWN:
                 multiTouch = true;
                 cancelLongPressCallback();
+                cancelPendingSingleTap();
+                return true;
+            case MotionEvent.ACTION_POINTER_UP:
+                // 多指抬起后不要再把这次手势当成点击/翻页
+                multiTouch = true;
+                cancelLongPressCallback();
+                cancelPendingSingleTap();
                 return true;
             case MotionEvent.ACTION_MOVE:
                 if (multiTouch) {
@@ -466,12 +515,12 @@ public final class FeedPager extends ViewGroup {
                 }
                 if (albumSwipe) {
                     FeedPage page = currentPage();
-                    if (dx > getWidth() * 0.12f) {
-                        page.previousAlbum();
-                        albumSwipe = false;
-                        suppressTapUntilUp = true;
-                    } else if (dx < -getWidth() * 0.12f) {
-                        page.advanceAlbum();
+                    if (page != null && AlbumNav.dragCrossed(dx, getWidth())) {
+                        if (dx > 0) {
+                            page.previousAlbum();
+                        } else {
+                            page.advanceAlbum();
+                        }
                         albumSwipe = false;
                         suppressTapUntilUp = true;
                     }
@@ -505,9 +554,33 @@ public final class FeedPager extends ViewGroup {
                     velocityY = syntheticVelocity;
                 }
                 cancelLongPressCallback();
+                // 这次手势不是「干净的一下点击」时（滑动 / 长按 / 多指 / 图集横滑），
+                // 撤掉上一击待判定的单击，别在翻页之后突然暂停
+                if (dragging || scrubMode || longPressFired || albumSwipe
+                        || horizontalGesture || multiTouch || suppressTapUntilUp) {
+                    cancelPendingSingleTap();
+                }
                 FeedPage upPage = currentPage();
                 if (upPage != null) {
                     upPage.onAlbumTouchUp();
+                }
+                if (multiTouch) {
+                    // 双指缩放/误触的抬手不该翻页，也不该 seek
+                    multiTouch = false;
+                    dragging = false;
+                    albumSwipe = false;
+                    horizontalGesture = false;
+                    if (scrubMode) {
+                        if (upPage != null) {
+                            upPage.hideScrub();
+                        }
+                        scrubMode = false;
+                    }
+                    return true;
+                }
+                if (scrubMode) {
+                    finishScrub();
+                    return true;
                 }
                 if (longPressFired) {
                     FeedPage page = currentPage();
@@ -519,11 +592,19 @@ public final class FeedPager extends ViewGroup {
                     }
                     return true;
                 }
-                if (scrubMode) {
-                    finishScrub();
-                    return true;
-                }
                 if (albumSwipe) {
+                    // MOVE 被系统合并、位移没到拖动阈值时的快速横扫：按抬手速度补切一张，
+                    // 对齐竖直方向那段兜底，别让用户觉得「划了没反应」。
+                    FeedPage page = currentPage();
+                    float upDx = event.getX() - downX;
+                    if (page != null
+                            && AlbumNav.flingCrossed(upDx, (float) gestureMs, getWidth())) {
+                        if (upDx > 0) {
+                            page.previousAlbum();
+                        } else {
+                            page.advanceAlbum();
+                        }
+                    }
                     albumSwipe = false;
                     horizontalGesture = false;
                     return true;
@@ -573,6 +654,7 @@ public final class FeedPager extends ViewGroup {
                 return true;
             case MotionEvent.ACTION_CANCEL:
                 cancelLongPressCallback();
+                cancelPendingSingleTap();
                 if (longPressFired) {
                     currentPage().setSpeedBoost(false);
                     currentPage().setSpeedLabel(false);
@@ -613,41 +695,69 @@ public final class FeedPager extends ViewGroup {
         float y = event.getY();
         int target = page.hitTest(x, y);
         if (target == FeedPage.HIT_PROGRESS) {
+            firePendingSingleTap();
             seekToFraction(page.progressFractionAt(x));
             return;
         }
         if (target != FeedPage.HIT_NONE) {
+            // 侧栏 / 顶部图标立即生效，不参与双击判定；上一击的补发不能丢
+            firePendingSingleTap();
             if (listener != null) {
                 listener.onTap(page, target, x, y);
             }
             return;
         }
         if (page.handleCaptionTap(x, y)) {
+            firePendingSingleTap();
             return;
         }
-        long now = SystemClock.uptimeMillis();
-        boolean doubleTap = now - lastTapTime < 320
-                && Math.hypot(x - lastTapX, y - lastTapY) < dp(90);
-        if (doubleTap) {
-            handler.removeCallbacks(singleTapRunnable);
-            lastTapTime = 0;
-            if (listener != null) {
-                listener.onDoubleTap(page, x, y);
+        // 内容区：单击暂停/继续，双击收藏。第一下先等一个双击窗口，
+        // 否则两下会变成「暂停 + 继续」，画面白闪一次。
+        long now = event.getEventTime();
+        if (pendingSingleTap != null) {
+            boolean close = Math.abs(x - lastTapX) <= doubleTapSlop
+                    && Math.abs(y - lastTapY) <= doubleTapSlop;
+            cancelPendingSingleTap();
+            if (close && now - lastTapTime <= DOUBLE_TAP_TIMEOUT_MS) {
+                if (listener != null) {
+                    listener.onDoubleTap(page, x, y);
+                }
+                return;
             }
-            return;
+            // 两下离得太远：先补上第一下的单击，这一下再按新的单击处理
+            if (listener != null) {
+                listener.onTap(page, FeedPage.HIT_NONE, lastTapX, lastTapY);
+            }
         }
         lastTapTime = now;
         lastTapX = x;
         lastTapY = y;
-        handler.removeCallbacks(singleTapRunnable);
-        handler.postDelayed(singleTapRunnable, 260);
+        final FeedPage tapPage = page;
+        pendingSingleTap = () -> {
+            pendingSingleTap = null;
+            if (tapPage == currentPage() && listener != null) {
+                listener.onTap(tapPage, FeedPage.HIT_NONE, x, y);
+            }
+        };
+        handler.postDelayed(pendingSingleTap, DOUBLE_TAP_TIMEOUT_MS);
     }
 
-    private final Runnable singleTapRunnable = () -> {
-        if (listener != null) {
-            listener.onTap(currentPage(), FeedPage.HIT_NONE, lastTapX, lastTapY);
+    /** 立刻把待判定的单击执行掉（点到按钮 / 话题时，不能吞掉上一击）。 */
+    private void firePendingSingleTap() {
+        Runnable pending = pendingSingleTap;
+        if (pending != null) {
+            handler.removeCallbacks(pending);
+            pendingSingleTap = null;
+            pending.run();
         }
-    };
+    }
+
+    private void cancelPendingSingleTap() {
+        if (pendingSingleTap != null) {
+            handler.removeCallbacks(pendingSingleTap);
+            pendingSingleTap = null;
+        }
+    }
 
     // ---------- 进度条拖动 ----------
     private void beginScrub(float x) {
@@ -744,6 +854,7 @@ public final class FeedPager extends ViewGroup {
 
     public void destroy() {
         handler.removeCallbacksAndMessages(null);
+        pendingSingleTap = null;
         for (FeedPage page : pages) {
             page.destroy();
         }

@@ -48,6 +48,15 @@ public final class MediaProxy {
         thread.setDaemon(true);
         return thread;
     });
+    /**
+     * 「后面 10 个作品」的预热单独一条线程：预热会排很多个 2MB 的任务，
+     * 如果和播放共用一个池，拖动进度条后的续传要排在它们后面，画面就会干等。
+     */
+    private final ExecutorService prefetchPool = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "media-prefetch");
+        thread.setDaemon(true);
+        return thread;
+    });
     private final ExecutorService clientPool = Executors.newCachedThreadPool(runnable -> {
         Thread thread = new Thread(runnable, "media-http");
         thread.setDaemon(true);
@@ -65,8 +74,20 @@ public final class MediaProxy {
     private volatile DavClient client;
     private volatile int port;
     private volatile boolean running;
+    /** 正在后台清缓存：这期间对外报 0，别让设置页显示「清完了还剩 4 GB」。 */
+    private volatile boolean clearing;
     private ServerSocket server;
     private volatile long cacheLimit = 4L * 1024 * 1024 * 1024;
+    /** cacheBytes() 会递归 stat 整个缓存目录：首页/设置页频繁问，缓存 15 秒。 */
+    private final Object sizeLock = new Object();
+    private long sizeCached;
+    private long sizeCachedAt;
+    /** 缓存过期时只让一个线程去递归 stat，避免多个线程同时扫几万个文件。 */
+    private final java.util.concurrent.atomic.AtomicBoolean sizeComputing =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static final long SIZE_TTL_MS = 15_000L;
+    /** trim 要遍历整个缓存目录，别每下完一个文件就扫一遍。 */
+    private volatile long lastTrimAt;
 
     public MediaProxy(Context context) {
         this.context = context.getApplicationContext();
@@ -116,11 +137,36 @@ public final class MediaProxy {
 
     public void setCacheLimit(long bytes) {
         cacheLimit = Math.max(128L * 1024 * 1024, bytes);
-        trimAsync();
+        // 上限变了要立刻按新上限清一次，不能等下一次播放结束
+        trimAsync(true);
     }
 
     public long cacheBytes() {
-        return sizeOf(root);
+        if (clearing) {
+            return 0L;
+        }
+        long now = System.currentTimeMillis();
+        synchronized (sizeLock) {
+            if (sizeCachedAt > 0 && now - sizeCachedAt < SIZE_TTL_MS) {
+                return sizeCached;
+            }
+        }
+        // 递归 stat 整个缓存目录可能要几万次，放到锁外做，别挡住下载线程的 cacheBytes()
+        if (!sizeComputing.compareAndSet(false, true)) {
+            synchronized (sizeLock) {
+                return sizeCached;
+            }
+        }
+        try {
+            long size = sizeOf(root);
+            synchronized (sizeLock) {
+                sizeCached = size;
+                sizeCachedAt = System.currentTimeMillis();
+            }
+            return size;
+        } finally {
+            sizeComputing.set(false);
+        }
     }
 
     public long cacheLimit() {
@@ -135,6 +181,14 @@ public final class MediaProxy {
                 clientPool.execute(() -> handle(socket));
             } catch (IOException exc) {
                 if (!running) {
+                    return;
+                }
+                // accept 连续失败（fd 耗尽/系统策略）时不能空转，否则 100% CPU 还不留日志
+                android.util.Log.w("JYWatch", "proxy accept failed", exc);
+                try {
+                    Thread.sleep(200L);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
                     return;
                 }
             }
@@ -156,8 +210,37 @@ public final class MediaProxy {
             if (entry.complete || entry.downloading || entry.cancel) {
                 return;
             }
+            entry.prefetchLimit = 0;
             entry.pumpStart = firstGap(entry, 0);
             startPumpLocked(entry);
+        }
+    }
+
+    /**
+     * 只预取开头的一小段（给「后面 10 个作品」预热用）。
+     *
+     * 不把整段视频都拉下来：每个作品只补 `bytes` 字节，播放器切过去时再按需续传。
+     * 已经预取过、正在下载、或者已经完整缓存的条目直接跳过。
+     */
+    public void prefetchPrefix(String rel, String name, long size, long bytes) {
+        if (size <= 0 || bytes <= 0) {
+            return;
+        }
+        Entry entry = register(rel, name, size);
+        synchronized (entry.lock) {
+            entry.lastUsed = System.currentTimeMillis();
+            if (entry.complete || entry.downloading || entry.cancel || entry.prefetchedPrefix) {
+                return;
+            }
+            long start = firstGap(entry, 0);
+            long limit = Math.min(size, start + bytes);
+            entry.prefetchedPrefix = true;
+            if (start >= limit) {
+                return;
+            }
+            entry.prefetchLimit = limit;
+            entry.pumpStart = start;
+            startPumpLocked(entry, true);
         }
     }
 
@@ -183,14 +266,18 @@ public final class MediaProxy {
             while (true) {
                 long until = awaitAvailable(entry, 0L, deadline);
                 boolean complete;
+                String error;
+                long sizeNow;
                 synchronized (entry.lock) {
                     complete = entry.complete;
+                    error = entry.error;
+                    sizeNow = entry.size;
                 }
-                if (complete || entry.size > 0 && until >= entry.size) {
+                if (complete || (sizeNow > 0 && until >= sizeNow)) {
                     break;
                 }
-                if (entry.error != null) {
-                    throw new IOException(entry.error);
+                if (error != null) {
+                    throw new IOException(error);
                 }
             }
             long actual;
@@ -232,12 +319,24 @@ public final class MediaProxy {
             }
         }
         entries.clear();
-        File[] children = root.listFiles();
-        if (children != null) {
-            for (File child : children) {
-                deleteRecursive(child);
-            }
+        synchronized (sizeLock) {
+            sizeCached = 0L;
+            sizeCachedAt = System.currentTimeMillis();
         }
+        // 最多 8GB 的目录递归删除不能占着主线程（设置页「清空视频缓存」就在主线程调）
+        clearing = true;
+        maintenancePool.execute(() -> {
+            try {
+                File[] children = root.listFiles();
+                if (children != null) {
+                    for (File child : children) {
+                        deleteRecursive(child);
+                    }
+                }
+            } finally {
+                clearing = false;
+            }
+        });
     }
 
     /** 云端删除后，把这个作品（或整个作者目录）的播放缓存丢掉。 */
@@ -261,6 +360,7 @@ public final class MediaProxy {
             entry.marker.delete();
             entries.remove(entry.key);
         }
+        invalidateSize();
     }
 
     // ---------- 条目 ----------
@@ -314,7 +414,13 @@ public final class MediaProxy {
         boolean downloading;
         boolean complete;
         boolean cancel;
-        String error;
+        volatile String error;
+        /** >0 表示这是「只预取到某个位置」的任务，播到该位置后再继续拉。 */
+        volatile long prefetchLimit;
+        boolean prefetchedPrefix;
+        /** 上一次失败的时间：允许等待方在退避之后重启一次 pump，别让失败变成永久状态。 */
+        long lastFailureAt;
+        int restarts;
         int readers;
 
         Entry(String key, String rel, String name, long size, File file, File marker) {
@@ -372,12 +478,19 @@ public final class MediaProxy {
 
     // ---------- 下载 ----------
     private void startPumpLocked(Entry entry) {
+        startPumpLocked(entry, false);
+    }
+
+    /**
+     * @param background 预热任务走单独的线程，播放器的续传不用排在它们后面。
+     */
+    private void startPumpLocked(Entry entry, boolean background) {
         if (entry.downloading || entry.complete || entry.cancel) {
             return;
         }
         entry.downloading = true;
         entry.error = null;
-        downloadPool.execute(() -> pump(entry));
+        (background ? prefetchPool : downloadPool).execute(() -> pump(entry));
     }
 
     private void pump(Entry entry) {
@@ -422,6 +535,7 @@ public final class MediaProxy {
                 synchronized (entry.lock) {
                     entry.error = message == null || message.isEmpty()
                             ? "下载失败" : message;
+                    entry.lastFailureAt = System.currentTimeMillis();
                 }
             }
             synchronized (entry.lock) {
@@ -477,6 +591,7 @@ public final class MediaProxy {
         }
         try {
             RandomAccessFile raf = new RandomAccessFile(entry.file, "rw");
+            boolean limited = false;
             try {
                 byte[] buffer = new byte[64 * 1024];
                 int read;
@@ -491,10 +606,16 @@ public final class MediaProxy {
                     synchronized (entry.lock) {
                         addRange(entry, position, position + read);
                         entry.pumpPos = position + read;
+                        entry.restarts = 0;
                         entry.lock.notifyAll();
                     }
                     position += read;
                     if (entry.size > 0 && position >= entry.size) {
+                        break;
+                    }
+                    if (entry.prefetchLimit > 0 && position >= entry.prefetchLimit) {
+                        // 「只预热一段」到这里就够了，播到这儿时 awaitAvailable 会清掉上限续传
+                        limited = true;
                         break;
                     }
                 }
@@ -504,11 +625,11 @@ public final class MediaProxy {
                 } catch (IOException ignored) {
                 }
             }
+            if (entry.size > 0 && position < entry.size && !limited) {
+                throw new IOException("连接提前结束（" + position + "/" + entry.size + "）");
+            }
         } finally {
             stream.close();
-        }
-        if (entry.size > 0 && position < entry.size) {
-            throw new IOException("连接提前结束（" + position + "/" + entry.size + "）");
         }
     }
 
@@ -516,6 +637,10 @@ public final class MediaProxy {
     private long awaitAvailable(Entry entry, long position, long deadline) throws IOException {
         while (true) {
             synchronized (entry.lock) {
+                if (entry.prefetchLimit > 0 && position >= entry.prefetchLimit) {
+                    // 播放已经追上预热段：解除上限，pump 接着往后续传
+                    entry.prefetchLimit = 0;
+                }
                 long until = coveredUntil(entry, position);
                 if (until > position) {
                     return until;
@@ -523,8 +648,17 @@ public final class MediaProxy {
                 if (entry.size > 0 && position >= entry.size) {
                     return entry.size;
                 }
-                if (entry.error != null) {
-                    throw new IOException(entry.error);
+                if (entry.error != null && !entry.downloading) {
+                    long now = System.currentTimeMillis();
+                    if (now - entry.lastFailureAt < 3000L || entry.restarts >= 5) {
+                        throw new IOException(entry.error);
+                    }
+                    // pump 已经放弃重试了：隔几秒给一次重新开始的机会。
+                    // 以前 error 是粘滞的，一次瞬时断流就让这个文件在本次进程里永久放不了。
+                    entry.error = null;
+                    entry.restarts++;
+                    entry.pumpStart = firstGap(entry, position);
+                    startPumpLocked(entry);
                 }
                 if (entry.cancel) {
                     throw new IOException("已取消");
@@ -605,9 +739,20 @@ public final class MediaProxy {
                 child.delete();
             }
         }
+        invalidateSize();
     }
 
     private void trimAsync() {
+        trimAsync(false);
+    }
+
+    private void trimAsync(boolean force) {
+        long now = System.currentTimeMillis();
+        if (!force && now - lastTrimAt < 15_000L) {
+            // 连着下完几个文件时不用每次都遍历缓存目录
+            return;
+        }
+        lastTrimAt = now;
         maintenancePool.execute(() -> {
             synchronized (trimLock) {
                 trim();
@@ -616,7 +761,13 @@ public final class MediaProxy {
     }
 
     private void trim() {
-        long total = cacheBytes();
+        // 递归 stat 放到锁外：trim 跑在维护线程上，别把下载路径的 cacheBytes() 一起堵住
+        long total = sizeOf(root);
+        synchronized (sizeLock) {
+            sizeCached = total;
+            sizeCachedAt = System.currentTimeMillis();
+        }
+        capEntries();
         if (total <= cacheLimit) {
             return;
         }
@@ -646,20 +797,71 @@ public final class MediaProxy {
             entries.remove(entry.key);
             total -= size;
         }
+        synchronized (sizeLock) {
+            sizeCached = Math.max(0L, total);
+            sizeCachedAt = System.currentTimeMillis();
+        }
     }
 
-    private static long sizeOf(File file) {
-        if (file == null || !file.exists()) {
+    private void invalidateSize() {
+        synchronized (sizeLock) {
+            sizeCachedAt = 0L;
+        }
+    }
+
+    /**
+     * entries 一个作品一条，长会话里会越积越多（每条还带一个 TreeMap）。
+     * 超过 3000 条就把最久没用的空闲条目从内存里摘掉：只丢 Entry，不删缓存文件，
+     * 下次再放会按 `.ok` 标记直接复用。
+     */
+    private void capEntries() {
+        if (entries.size() <= 3000) {
+            return;
+        }
+        List<Entry> idle = new ArrayList<>();
+        long cutoff = System.currentTimeMillis() - 120_000L;
+        for (Entry entry : entries.values()) {
+            synchronized (entry.lock) {
+                if (entry.readers == 0 && !entry.downloading && !entry.cancel
+                        && entry.lastUsed < cutoff) {
+                    idle.add(entry);
+                }
+            }
+        }
+        idle.sort(Comparator.comparingLong(entry -> entry.lastUsed));
+        for (Entry entry : idle) {
+            if (entries.size() <= 2000) {
+                break;
+            }
+            synchronized (entry.lock) {
+                if (entry.readers > 0 || entry.downloading) {
+                    continue;
+                }
+                entry.cancel = true;
+            }
+            entries.remove(entry.key);
+        }
+    }
+
+    private static long sizeOf(File root) {
+        if (root == null || !root.exists()) {
             return 0L;
         }
-        if (file.isFile()) {
-            return file.length();
-        }
+        // 迭代遍历：缓存目录层级可能很深，递归版有栈溢出风险
         long total = 0;
-        File[] children = file.listFiles();
-        if (children != null) {
-            for (File child : children) {
-                total += sizeOf(child);
+        java.util.ArrayDeque<File> stack = new java.util.ArrayDeque<>();
+        stack.push(root);
+        while (!stack.isEmpty()) {
+            File file = stack.pop();
+            if (file.isFile()) {
+                total += file.length();
+            } else {
+                File[] children = file.listFiles();
+                if (children != null) {
+                    for (File child : children) {
+                        stack.push(child);
+                    }
+                }
             }
         }
         return total;
@@ -668,7 +870,8 @@ public final class MediaProxy {
     // ---------- HTTP ----------
     private void handle(Socket socket) {
         try (Socket clientSocket = socket) {
-            InputStream input = clientSocket.getInputStream();
+            // 播放器每个 Range 请求两三百字节头，直接 read() 一字节一个 syscall 太浪费
+            InputStream input = new java.io.BufferedInputStream(clientSocket.getInputStream(), 4096);
             OutputStream rawOutput = clientSocket.getOutputStream();
             BufferedOutputStream output = new BufferedOutputStream(rawOutput, 64 * 1024);
             String requestLine = readLine(input);
@@ -710,7 +913,10 @@ public final class MediaProxy {
                 writeEmpty(output, 404, "Not Found");
                 return;
             }
-            long size = entry.size;
+            long size;
+            synchronized (entry.lock) {
+                size = entry.size;
+            }
             if (size <= 0) {
                 DavClient dav = client;
                 if (dav == null) {
@@ -723,7 +929,16 @@ public final class MediaProxy {
                     writeEmpty(output, 502, "Bad Gateway");
                     return;
                 }
-                entry.size = size;
+                synchronized (entry.lock) {
+                    if (entry.size <= 0) {
+                        entry.size = size;
+                        entry.lock.notifyAll();
+                    } else {
+                        // pump 已经按 GET 的实际字节数写过 size：以它为准。
+                        // 以前无锁覆盖，HEAD 探测值偏小会把下完的文件标成「完整但截断」。
+                        size = entry.size;
+                    }
+                }
             }
             if (size <= 0) {
                 writeEmpty(output, 404, "Not Found");
@@ -790,7 +1005,13 @@ public final class MediaProxy {
                     entry.lock.notifyAll();
                 }
             }
-        } catch (Exception ignored) {
+        } catch (Exception exc) {
+            // 客户端断开（播放器 seek/切条）很常见，但其它异常不能静默吞掉
+            String message = exc.getMessage();
+            if (!(exc instanceof java.io.IOException) || message == null
+                    || !message.contains("Broken pipe")) {
+                android.util.Log.w("JYWatch", "proxy request failed", exc);
+            }
         }
     }
 
@@ -811,6 +1032,10 @@ public final class MediaProxy {
         try {
             while (position <= end) {
                 long until = awaitAvailable(entry, position, deadline);
+                if (entries.get(entry.key) != entry) {
+                    // 缓存被清掉/条目被换掉了：别再往这条已经作废的流里写
+                    throw new IOException("缓存已失效");
+                }
                 long chunkEnd = Math.min(end + 1, until);
                 if (chunkEnd <= position) {
                     throw new IOException("缓存读取失败");
@@ -827,6 +1052,9 @@ public final class MediaProxy {
                     output.write(buffer, 0, read);
                     position += read;
                 }
+                // 一轮拿到的数据可能只有几 KB，不 flush 就会被 64KB 缓冲攒住，
+                // 播放器明明有数据可读却一直等着
+                output.flush();
                 deadline = System.currentTimeMillis() + WAIT_TIMEOUT_MS;
             }
             output.flush();

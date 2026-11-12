@@ -18,3 +18,21 @@ JingYingWatchData/
 # 系统垃圾
 .DS_Store
 Thumbs.db
+
+# 每次构建生成的带版本号 APK（latest 仍保留，安装脚本靠它取最新版）
+android/JingYing-Watch-v*.apk
+
+# build 目录被占用时改名的历史中间产物，统一收在这里
+android/build-*/
+android/build-stale/
+
+# 内嵌工具链：体积大、可重新下载，不属于源码
+tools/android-sdk/
+tools/jdk17/
+
+# 本机模拟器、运行日志
+AndroidEmulator/
+adb.log
+
+# 历史版本测试脚本工作目录没固定时留下的临时 tar（可直接整个删掉）
+android/android/

@@ -86,6 +86,15 @@ public final class Library {
     }
 
     public static List<Work> filter(List<Work> works, String author, String query, String kind) {
+        return filter(works, author, query, kind, true);
+    }
+
+    /**
+     * @param sort 输入本身已按时间排好序时传 false：过滤只是挑子集，顺序不会变，
+     *             1.6 万条每次搜索都重排一遍纯属浪费（首页就是这么调的）。
+     */
+    public static List<Work> filter(List<Work> works, String author, String query, String kind,
+                                    boolean sort) {
         String needle = query == null ? "" : query.trim().toLowerCase(Locale.CHINA);
         List<Work> result = new ArrayList<>();
         for (Work work : works) {
@@ -104,7 +113,9 @@ public final class Library {
             }
             result.add(work);
         }
-        sortByTime(result);
+        if (sort) {
+            sortByTime(result);
+        }
         return result;
     }
 
