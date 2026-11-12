@@ -1856,6 +1856,8 @@ public final class FeedPage extends FrameLayout {
             }
             playing = false;
         }
+        // 长按着直接切后台时松手事件可能收不到，别把跳帧那阵的静音留在页面上
+        endSeekBoost();
         // 图集页没有 player，停的是动图播放器
         pauseAlbumLive();
         if (musicPlayer != null) {
@@ -1976,6 +1978,10 @@ public final class FeedPage extends FrameLayout {
     }
 
     public void setSpeedBoost(boolean boost) {
+        if (!boost) {
+            // 松手：跳帧期间音频是静音的，先把音量还回去
+            endSeekBoost();
+        }
         speedBoost = boost;
         // 每次长按都从头试：上一次长按留下的「不支持」结论不能带到这一次
         speedNav.reset();
@@ -2000,14 +2006,23 @@ public final class FeedPage extends FrameLayout {
             restoreSpeed();
             return;
         }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-            speedNav.giveUp();
-            refreshSpeedLabel();
-            return;
-        }
         if (player == null || !prepared) {
             // 还没准备好：speedBoost 已经记下，onPrepared 里会补设。
             // 这里不能算失败，否则「还没准备好」会被误报成「不支持倍速」。
+            return;
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            // 老系统没有 PlaybackParams，但「定时往前 seek」照样能加速，别直接判死刑
+            if (!speedNav.inSeek()) {
+                startSeekBoost(SystemClock.uptimeMillis());
+            } else {
+                stepSeekBoost();
+            }
+            return;
+        }
+        if (speedNav.inSeek()) {
+            // 已经确认参数写法不管用，后面全走跳帧
+            stepSeekBoost();
             return;
         }
         if (surface == null) {
@@ -2023,13 +2038,18 @@ public final class FeedPage extends FrameLayout {
         int variant = speedNav.variant();
         try {
             player.setPlaybackParams(buildSpeedParams(variant));
-            speedNav.onSuccess();
-            android.util.Log.i("JYWatch", "倍速已设置为 " + speed + "×（写法 " + variant + "）");
+            // 不抛异常 ≠ 真的加速了：记下这一刻的位置，700ms 后拿进度自己验证
+            speedNav.onParamsApplied(now, positionMs());
+            android.util.Log.i("JYWatch", "倍速参数被接受 " + speed + "×（写法 " + variant + "），待实测");
         } catch (Exception exc) {
             speedNav.onFailure();
             android.util.Log.w("JYWatch", "setPlaybackParams 失败（写法 " + variant + "，第 "
                     + speedNav.failures() + " 次）：" + exc
                     + " playing=" + playing + " prepared=" + prepared + " surface=" + (surface != null));
+            if (speedNav.wantsSeek()) {
+                android.util.Log.i("JYWatch", "参数写法连续失败 " + speedNav.failures() + " 次，改走跳帧倍速");
+                startSeekBoost(now);
+            }
         }
         refreshSpeedLabel();
     }
@@ -2072,9 +2092,24 @@ public final class FeedPage extends FrameLayout {
 
     /** 正在 2× 时，每次进度刷新检查一下倍速有没有被打回 1×，被打回就补上。 */
     private void keepSpeed() {
-        if (!speedBoost || speedNav.unsupported()
-                || Build.VERSION.SDK_INT < Build.VERSION_CODES.M
-                || player == null || !prepared || surface == null) {
+        if (!speedBoost || speedNav.unsupported() || player == null || !prepared) {
+            return;
+        }
+        if (speedNav.inSeek()) {
+            // 跳帧模式：进度每刷一次就往前补一段
+            stepSeekBoost();
+            return;
+        }
+        long now = SystemClock.uptimeMillis();
+        long pos = positionMs();
+        if (speedNav.shouldProbe(now) && speedNav.probeIgnored(now, pos)) {
+            // 参数被接受、getPlaybackParams 也回报 2×，但画面还是原速——
+            // 这就是「提示说 2× 却看不出变化」的真正来源，只能改用跳帧
+            android.util.Log.w("JYWatch", "实测倍速未生效（700ms 只走了 " + pos + "ms），改走跳帧");
+            startSeekBoost(now);
+            return;
+        }
+        if (surface == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
             return;
         }
         try {
@@ -2084,6 +2119,60 @@ public final class FeedPage extends FrameLayout {
         } catch (Exception ignored) {
         }
         applySpeed(SpeedNav.BOOST);
+    }
+
+    /**
+     * 参数写法确认无效：改走「定时往前 seek」的跳帧倍速。
+     *
+     * <p>播放器本身还在 1× 往前走，每 {@link SpeedNav#SEEK_INTERVAL_MS} 补一段差值，
+     * 叠加起来就是 2×。比 {@code setPlaybackParams} 笨，但任何设备都一定有效。</p>
+     */
+    private void startSeekBoost(long now) {
+        speedNav.beginSeek(now, positionMs());
+        // 跳帧时音频会一顿一顿，长按这点时间里静音更自然；松手由 endSeekBoost 还原
+        try {
+            player.setVolume(0f, 0f);
+        } catch (Exception ignored) {
+        }
+        refreshSpeedLabel();
+        stepSeekBoost();
+    }
+
+    private void stepSeekBoost() {
+        if (player == null || !prepared) {
+            return;
+        }
+        long now = SystemClock.uptimeMillis();
+        if (!speedNav.hasSeekBase()) {
+            // 缓冲 / 起播会把基准作废，此刻重新记，免得跳帧停摆
+            speedNav.beginSeek(now, positionMs());
+        }
+        long target = speedNav.seekTarget(now, positionMs(), durationMs());
+        if (target < 0) {
+            return;
+        }
+        speedNav.markSeek(now);
+        try {
+            player.seekTo((int) target);
+        } catch (Exception exc) {
+            android.util.Log.w("JYWatch", "跳帧倍速 seek 失败：" + exc);
+            speedNav.giveUp();
+            refreshSpeedLabel();
+        }
+    }
+
+    /** 松手 / 切页：退出跳帧，音量按当前静音设置还原。 */
+    private void endSeekBoost() {
+        if (player == null) {
+            return;
+        }
+        if (speedNav.inSeek()) {
+            android.util.Log.i("JYWatch", "退出跳帧倍速，位置 " + positionMs() + "ms");
+        }
+        try {
+            player.setVolume(muted ? 0f : 1f, muted ? 0f : 1f);
+        } catch (Exception ignored) {
+        }
     }
 
     // ---------- 进度 ----------

@@ -1344,6 +1344,63 @@ public final class WatchTests {
         apiLow.giveUp();
         check("低版本直接判不支持", apiLow.unsupported());
         eq("低版本提示", "本机不支持倍速", apiLow.label());
+
+        // ---- 实测：参数被接受 ≠ 真的加速 ----
+        SpeedNav probe = new SpeedNav();
+        probe.onParamsApplied(0, 1_000);
+        eq("接受参数后进入参数模式", SpeedNav.MODE_PARAMS, probe.mode());
+        check("刚设完不急着下结论", !probe.shouldProbe(500));
+        check("到点才实测", probe.shouldProbe(700));
+        check("700ms 走了 1400ms 算真加速", !probe.probeIgnored(700, 2_400));
+        check("700ms 只走了 700ms 算被忽略", probe.probeIgnored(700, 1_700));
+        check("位置回退过（用户拖了进度条）不判", !probe.probeIgnored(700, 900));
+
+        // ---- 跳帧兜底 ----
+        SpeedNav seek = new SpeedNav();
+        seek.onFailure();
+        check("失败一次先换写法，不急着跳帧", !seek.wantsSeek());
+        seek.onFailure();
+        check("连续失败两次改走跳帧", seek.wantsSeek());
+        seek.beginSeek(10_000, 5_000);
+        check("已进入跳帧模式", seek.inSeek());
+        eq("跳帧时提示改为快进（便于区分走的哪条路）", "2× 快进", seek.label());
+        check("跳帧模式不再试变速参数", !seek.shouldAttempt(999_999));
+        eq("目标 = 起点 + 已过时间 × 2", 5_600L, seek.seekTarget(10_300, 5_300, 60_000));
+        seek.markSeek(10_300);
+        check("间隔内不重复 seek", seek.seekTarget(10_400, 5_700, 60_000) < 0);
+        eq("到下个间隔继续追", 6_200L, seek.seekTarget(10_600, 5_800, 60_000));
+
+        SpeedNav tail = new SpeedNav();
+        tail.beginSeek(0, 9_000);
+        eq("接近结尾夹到留白处，别跳到播完", 9_500L, tail.seekTarget(10_000, 9_000, 10_000));
+
+        SpeedNav noDur = new SpeedNav();
+        noDur.beginSeek(0, 0);
+        check("时长未知不跳（怕一跳就播完）", noDur.seekTarget(10_000, 1_000, 0) < 0);
+
+        SpeedNav closeLead = new SpeedNav();
+        closeLead.beginSeek(0, 0);
+        check("离目标太近不值得 seek", closeLead.seekTarget(300, 550, 60_000) < 0);
+
+        // 一秒内按 250ms 一档追，累计应该正好到 2 秒的位置
+        SpeedNav rate = new SpeedNav();
+        rate.beginSeek(0, 0);
+        long cursor = 0;
+        for (long t = 250; t <= 1_000; t += 250) {
+            long target = rate.seekTarget(t, cursor, 60_000);
+            check("每档都要往前补（t=" + t + "）", target > 0);
+            rate.markSeek(t);
+            cursor = target;
+        }
+        eq("1 秒追到 2 秒处", 2_000L, cursor);
+
+        SpeedNav keepMode = new SpeedNav();
+        keepMode.beginSeek(0, 0);
+        keepMode.restart();
+        check("缓冲结束后仍留在跳帧模式", keepMode.inSeek());
+        check("旧基准作废，等重新取", !keepMode.hasSeekBase());
+        keepMode.reset();
+        check("reset 退出跳帧", !keepMode.inSeek());
     }
 
     private static void searchInput() {
