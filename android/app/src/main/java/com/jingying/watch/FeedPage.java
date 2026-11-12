@@ -2104,8 +2104,14 @@ public final class FeedPage extends FrameLayout {
         long pos = positionMs();
         if (speedNav.shouldProbe(now) && speedNav.probeIgnored(now, pos)) {
             // 参数被接受、getPlaybackParams 也回报 2×，但画面还是原速——
-            // 这就是「提示说 2× 却看不出变化」的真正来源，只能改用跳帧
-            android.util.Log.w("JYWatch", "实测倍速未生效（700ms 只走了 " + pos + "ms），改走跳帧");
+            // 这就是「提示说 2× 却看不出变化」的真正来源。
+            // 不过 getCurrentPosition() 不是每台设备都实时，先给第二次机会再下结论，
+            // 免得把「位置还没刷新」误判成「没加速」，白白把平滑的 2× 换成跳帧。
+            if (!speedNav.suspect(now, pos)) {
+                android.util.Log.i("JYWatch", "倍速实测可疑（700ms 只走了 " + pos + "ms），再测一轮");
+                return;
+            }
+            android.util.Log.w("JYWatch", "两轮实测都没加速（位置 " + pos + "ms），改走跳帧");
             startSeekBoost(now);
             return;
         }
@@ -2143,21 +2149,36 @@ public final class FeedPage extends FrameLayout {
             return;
         }
         long now = SystemClock.uptimeMillis();
-        if (!speedNav.hasSeekBase()) {
-            // 缓冲 / 起播会把基准作废，此刻重新记，免得跳帧停摆
-            speedNav.beginSeek(now, positionMs());
+        long pos = positionMs();
+        if (!speedNav.hasSeekBase() || speedNav.landedShort(pos)) {
+            // 缓冲/起播会把基准作废；上一步 seek 落到更前面的关键帧也会让基准失真。
+            // 两种情况下都重取基准，否则会越追越偏、画面来回倒退
+            speedNav.beginSeek(now, pos);
         }
-        long target = speedNav.seekTarget(now, positionMs(), durationMs());
+        long target = speedNav.seekTarget(now, pos, durationMs());
         if (target < 0) {
             return;
         }
-        speedNav.markSeek(now);
+        speedNav.markSeek(now, target);
         try {
-            player.seekTo((int) target);
+            seekClosest((int) target);
         } catch (Exception exc) {
             android.util.Log.w("JYWatch", "跳帧倍速 seek 失败：" + exc);
             speedNav.giveUp();
             refreshSpeedLabel();
+        }
+    }
+
+    /**
+     * 精确跳转。默认的 {@code seekTo(int)} 语义是「跳到前一个关键帧」，
+     * 短视频 GOP 常有 1～4 秒，于是每跳一次都先退回好几秒再往前播——
+     * 画面就成了反复倒退 + 黑闪，这正是跳帧倍速看起来「卡顿」的主因。
+     */
+    private void seekClosest(int targetMs) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            player.seekTo(targetMs, MediaPlayer.SEEK_CLOSEST);
+        } else {
+            player.seekTo(targetMs);
         }
     }
 

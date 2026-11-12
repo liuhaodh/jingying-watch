@@ -1355,6 +1355,13 @@ public final class WatchTests {
         check("700ms 只走了 700ms 算被忽略", probe.probeIgnored(700, 1_700));
         check("位置回退过（用户拖了进度条）不判", !probe.probeIgnored(700, 900));
 
+        // 单次采样不算数：位置刷新滞后的设备会被误判，误判就把平滑 2× 换成跳帧
+        check("第一次可疑只是记下，不马上跳帧", !probe.suspect(700, 1_700));
+        check("重设基准后要再等一轮才测", !probe.shouldProbe(1_000));
+        check("等满 700ms 再测", probe.shouldProbe(1_400));
+        check("两轮都对不上才下结论", probe.suspect(1_400, 2_300));
+        check("确认后标记可疑", probe.suspected());
+
         // ---- 跳帧兜底 ----
         SpeedNav seek = new SpeedNav();
         seek.onFailure();
@@ -1382,23 +1389,31 @@ public final class WatchTests {
         closeLead.beginSeek(0, 0);
         check("离目标太近不值得 seek", closeLead.seekTarget(300, 550, 60_000) < 0);
 
-        // 一秒内按 250ms 一档追，累计应该正好到 2 秒的位置
+        // 落点偏前（seek 落到了更前面的关键帧）要能发现，否则越追越偏、画面倒退
+        SpeedNav landing = new SpeedNav();
+        landing.beginSeek(0, 5_000);
+        landing.markSeek(300, 5_600);
+        check("落点比目标差 500ms 算没落到", landing.landedShort(5_100));
+        check("落点在容差内不算", !landing.landedShort(5_400));
+        check("没记过目标时不下判断", !new SpeedNav().landedShort(0));
+
+        // 1.2 秒内按 300ms 一档追，累计应该正好到 2.4 秒的位置
         SpeedNav rate = new SpeedNav();
         rate.beginSeek(0, 0);
         long cursor = 0;
-        for (long t = 250; t <= 1_000; t += 250) {
+        for (long t = 300; t <= 1_200; t += 300) {
             long target = rate.seekTarget(t, cursor, 60_000);
             check("每档都要往前补（t=" + t + "）", target > 0);
-            rate.markSeek(t);
+            rate.markSeek(t, target);
             cursor = target;
         }
-        eq("1 秒追到 2 秒处", 2_000L, cursor);
+        eq("1.2 秒追到 2.4 秒处", 2_400L, cursor);
 
         SpeedNav keepMode = new SpeedNav();
         keepMode.beginSeek(0, 0);
         keepMode.restart();
         check("缓冲结束后仍留在跳帧模式", keepMode.inSeek());
-        check("旧基准作废，等重新取", !keepMode.hasSeekBase());
+        check("跳帧期间缓冲不清基准（否则跳幅忽大忽小）", keepMode.hasSeekBase());
         keepMode.reset();
         check("reset 退出跳帧", !keepMode.inSeek());
     }

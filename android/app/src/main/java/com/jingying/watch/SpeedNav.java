@@ -47,14 +47,22 @@ public final class SpeedNav {
     public static final float PROBE_MIN_RATIO = 1.4f;
 
     /**
-     * 跳帧的节流间隔。进度条是 220ms 刷一次，这里取 180 让每一轮都能补一次；
-     * 取 250 会变成隔轮才跳，跳幅翻倍、画面一顿一顿。
+     * 跳帧的节流间隔。进度条是 220ms 刷一次，这里取 300 而不是贴着 220：
+     * 跳一次就要重新定位关键帧、重新填缓冲，太密必然黑闪；300ms 已经能看出加速。
      */
-    public static final long SEEK_INTERVAL_MS = 180L;
+    public static final long SEEK_INTERVAL_MS = 300L;
     /** 目标时间轴只领先当前不到这么多就不值得 seek（seek 本身也要几十毫秒）。 */
-    public static final long SEEK_MIN_LEAD_MS = 150L;
+    public static final long SEEK_MIN_LEAD_MS = 200L;
     /** 留出尾部余量，别把自己 seek 到「播完」上去，否则长按中会跳下一条。 */
     public static final long SEEK_TAIL_MARGIN_MS = 500L;
+    /**
+     * seek 落点比目标靠前多少才算「没落到」。
+     *
+     * <p>默认的 {@code seekTo(int)} 是「跳到前一个关键帧」，抖音短视频的 GOP 常有 1～4 秒，
+     * 所以每次跳都可能退回好几秒、再往前播——表现就是画面反复倒退、一顿一顿。
+     * 靠这个容差发现落点不对，重新以实际位置为基准，避免越追越远。</p>
+     */
+    public static final long LANDING_TOLERANCE_MS = 400L;
 
     private int variant;
     private int failures;
@@ -65,9 +73,13 @@ public final class SpeedNav {
     private int mode;
     private long probeAt = Long.MIN_VALUE / 2;
     private long probePos;
+    /** 第一次实测觉得没加速，等第二轮确认。 */
+    private boolean suspected;
     private long seekBaseAt = Long.MIN_VALUE / 2;
     private long seekBasePos;
     private long lastSeekAt = Long.MIN_VALUE / 2;
+    /** 上一次 seek 的目标位置，用来判断落点有没有跑到目标前面去。 */
+    private long lastTargetMs = -1L;
 
     /** 新的一次长按 / 换了播放器：全部清零，从头再试。 */
     public void reset() {
@@ -78,9 +90,11 @@ public final class SpeedNav {
         mode = 0;
         probeAt = Long.MIN_VALUE / 2;
         probePos = 0;
+        suspected = false;
         seekBaseAt = Long.MIN_VALUE / 2;
         seekBasePos = 0;
         lastSeekAt = Long.MIN_VALUE / 2;
+        lastTargetMs = -1L;
     }
 
     /**
@@ -92,10 +106,15 @@ public final class SpeedNav {
         applied = false;
         lastAttemptAt = Long.MIN_VALUE / 2;
         probeAt = Long.MIN_VALUE / 2;
+        suspected = false;
         // 已经确认要走跳帧的，别因为缓冲结束又退回参数写法白试一轮；
-        // 但长按期间实际位置变了，旧基准作废，等 FeedPage 重新 beginSeek
-        lastSeekAt = Long.MIN_VALUE / 2;
-        seekBaseAt = Long.MIN_VALUE / 2;
+        // 而且跳帧期间的 BUFFERING_END 多半是我们自己 seek 触发的，
+        // 这时候清基准会让每一跳都从当前位置重新起算，跳幅忽大忽小。
+        if (mode != MODE_SEEK) {
+            lastSeekAt = Long.MIN_VALUE / 2;
+            seekBaseAt = Long.MIN_VALUE / 2;
+            lastTargetMs = -1L;
+        }
     }
 
     /** 这一次该用第几种参数写法：0 带 pitch / 1 只给 speed / 2 沿用播放器当前参数。 */
@@ -150,6 +169,7 @@ public final class SpeedNav {
         onSuccess();
         probeAt = nowMs;
         probePos = positionMs;
+        suspected = false;
     }
 
     /** 每次失败换一种写法，别拿同一套参数反复撞墙。 */
@@ -196,8 +216,29 @@ public final class SpeedNav {
     }
 
     /**
+     * 第一次疑似没加速：重设采样基准，隔 {@link #PROBE_DELAY_MS} 再测一轮。
+     * 返回 true 表示已经两轮都对不上，可以下结论去跳帧了。
+     *
+     * <p>为什么不一次定性：{@code getCurrentPosition()} 不是每台设备都实时
+     * （有的几百毫秒才更新一次），单次采样很容易把「位置还没来得及刷新」当成「没加速」。
+     * 误判代价很大——明明能平滑 2× 的设备会被切成跳帧，画面立刻变卡。</p>
+     */
+    public boolean suspect(long nowMs, long positionMs) {
+        if (!suspected) {
+            suspected = true;
+            probeAt = nowMs;
+            probePos = positionMs;
+            return false;
+        }
+        return true;
+    }
+
+    public boolean suspected() {
+        return suspected;
+    }
+
+    /**
      * 开始跳帧：以当前时刻 / 位置为基准，之后按目标时间轴追赶。
-     * 位置传 -1 表示拿不到，交给 {@link #seekTarget} 的 duration 兜底判断。
      */
     public void beginSeek(long nowMs, long positionMs) {
         mode = MODE_SEEK;
@@ -205,7 +246,9 @@ public final class SpeedNav {
         seekBaseAt = nowMs;
         seekBasePos = Math.max(0L, positionMs);
         lastSeekAt = Long.MIN_VALUE / 2;
+        lastTargetMs = -1L;
         probeAt = Long.MIN_VALUE / 2;
+        suspected = false;
     }
 
     /** {@link #restart()} 之后基准会作废，调用方要先重新 {@link #beginSeek}。 */
@@ -244,6 +287,24 @@ public final class SpeedNav {
     /** seek 真的发出去了才记时间，失败的下一轮还能再试。 */
     public void markSeek(long nowMs) {
         lastSeekAt = nowMs;
+    }
+
+    /** 同上，顺便记下目标位置，用来判断落点。 */
+    public void markSeek(long nowMs, long targetMs) {
+        lastSeekAt = nowMs;
+        lastTargetMs = targetMs;
+    }
+
+    /**
+     * 上一次 seek 是不是没落到目标附近（落到了更前面的关键帧）。
+     * 是的话说明再按原来的基准追只会越追越偏，得重新取基准。
+     */
+    public boolean landedShort(long positionMs) {
+        return lastTargetMs >= 0 && positionMs < lastTargetMs - LANDING_TOLERANCE_MS;
+    }
+
+    public long lastTarget() {
+        return lastTargetMs;
     }
 
     /** API 太低 / 明确拿不到变速能力：直接判不支持，不用再试。 */
