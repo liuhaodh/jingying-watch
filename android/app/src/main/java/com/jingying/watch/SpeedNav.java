@@ -75,6 +75,8 @@ public final class SpeedNav {
     private long probePos;
     /** 第一次实测觉得没加速，等第二轮确认。 */
     private boolean suspected;
+    /** 这次长按已经为了倍速重建过一次播放器（华为等机型首次设置不生效，重建后才行）。 */
+    private boolean rebuilt;
     private long seekBaseAt = Long.MIN_VALUE / 2;
     private long seekBasePos;
     private long lastSeekAt = Long.MIN_VALUE / 2;
@@ -91,6 +93,7 @@ public final class SpeedNav {
         probeAt = Long.MIN_VALUE / 2;
         probePos = 0;
         suspected = false;
+        rebuilt = false;
         seekBaseAt = Long.MIN_VALUE / 2;
         seekBasePos = 0;
         lastSeekAt = Long.MIN_VALUE / 2;
@@ -235,6 +238,25 @@ public final class SpeedNav {
 
     public boolean suspected() {
         return suspected;
+    }
+
+    /**
+     * 还能不能再为倍速重建一次播放器。
+     *
+     * <p>不少机型（华为等）第一次设倍速就是不生效，把播放器释放重建、重新 prepare
+     * 之后再设才成功。这比重写播放器引擎便宜得多，也比跳帧平滑，所以排在跳帧前面试，
+     * 但一次长按只值得重建一次。</p>
+     */
+    public boolean canRebuild() {
+        return !rebuilt && mode != MODE_SEEK && !unsupported();
+    }
+
+    public void markRebuilt() {
+        rebuilt = true;
+    }
+
+    public boolean rebuilt() {
+        return rebuilt;
     }
 
     /**

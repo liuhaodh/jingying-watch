@@ -2271,3 +2271,59 @@ v1.0.32 把重点放在「`setPlaybackParams()` 抛异常 ≠ 不支持」上，
   （说明上轮是单次采样误判，现在被两轮确认挡住了）。
 - 长按松手：位置从当前处继续，不回退、不重复播放已经跳过的片段。
 - 长按到接近结尾：不跳下一条。
+
+## 第五十六轮：倍速彻底修——写法顺序错了 + 重建播放器（2026-11-12）
+
+### 真正的根因（前两轮都没抓到）
+查 Android 官方文档与 AOSP 示例，`setPlaybackParams` 的标准用法是：
+
+```java
+mp.setPlaybackParams(mp.getPlaybackParams().setSpeed(speed));
+```
+
+**沿用播放器当前的参数对象**，改完再塞回去。这个对象里带着引擎已初始化的内部模式
+（audio fallback、sync engine 句柄）；而 `new PlaybackParams()` 是个干净对象，
+**部分机型会接受但不执行**——不抛异常、`getPlaybackParams()` 也回报 2.0，画面还是原速。
+
+而本项目的 `buildSpeedParams()` 把「沿用当前参数」排在**第 3 位**（`variant >= 2`），
+前两位都是 `new PlaybackParams()`。前两位既然不抛异常，`variant` 就永远停在 0，
+第 3 种写法**一次都没被执行过**。于是：
+- v1.0.32 修的是「抛异常」那条线 → 用户看到的仍是原速；
+- v1.0.34/35 用跳帧兜底硬顶 → 能看到加速了，但是有损、卡顿；
+- 真正有效的那种写法一直躺在代码里没被调用。
+
+### 第二层：首次设置不生效的机型
+华为等机型还存在「第一次设倍速不生效、把 MediaPlayer 释放重建再设才行」的已知行为
+（社区里成型的做法是记录位置 → 重建 → seek 回去 → 重设）。所以即使写法对了，
+也值得给一次重建机会，而不是直接掉到跳帧。
+
+### 改动
+1. **`buildSpeedParams()` 顺序改正**：0 = `getPlaybackParams().setSpeed(2).setPitch(1)`
+   （官方写法，保持音调）；1 = `new PlaybackParams().setSpeed(2).setPitch(1)`；
+   2 = `new PlaybackParams().setSpeed(2)`。`getPlaybackParams()` 抛异常时自动落到 1。
+2. **新增「重建播放器」这一级**（`rebuildForSpeed()`）：
+   - 实测两轮都没加速、或参数连续抛异常 2 次时触发，**排在跳帧之前**；
+   - 释放当前 MediaPlayer，记下 `resumeAtMs`，重新 `prepareVideo()`；
+   - `onPrepared` 里先 `seekTo(resumeAtMs)` 回到原位置，再延迟 300ms 设倍速——
+     seek 是异步的，不等落点稳定就设，实测基准会被「位置从 0 跳回原处」污染，
+     明明没加速也会算成加速；
+   - 一次长按只重建一次（`SpeedNav.canRebuild()` / `markRebuilt()`），避免反复重建；
+   - `resumeAtMs` 在 `bind()` 与 `releasePlayers()` 里复位。
+3. **跳帧降为最后兜底**：重建后仍不生效才走（`SEEK_CLOSEST` + 落点纠偏那套保留）。
+4. 三级顺序固定为：**参数（正确写法）→ 重建播放器 → 跳帧**，每一级都有实测把关，
+   不会出现「以为成功了其实没动」。
+
+### 验证
+- `SpeedNav` 新增 3 项：确认没加速后仍可重建、重建过不再重复重建、`reset()` 后
+  新一次长按又能重建；`speedBoost` 用例里「第一次写法」的断言同步改为
+  「沿用播放器当前参数（官方推荐写法）」。
+- 单元测试 **PASS 418 / FAIL 0**（原 415）。
+- `android\build.ps1 -Test` 全绿 → **v1.0.36（code 46）**，产物
+  `android/JingYing-Watch-v1.0.36.apk`。
+
+### 待真机验证（本机无 adb，未回归）
+- 长按：这次应该直接是**平滑的 2×**（有声音、音调不变），提示「2× 播放中」。
+- 若长按开始时有一下短暂的重新加载（约 0.3～1 秒），说明触发了「重建播放器」这一级，
+  之后应变成平滑 2×；位置不应跳回开头。
+- 只有提示「2× 快进」才说明掉到了跳帧兜底（此时仍是有损快进 + 静音）。
+- 松手：立即恢复 1× 与声音，位置连续。

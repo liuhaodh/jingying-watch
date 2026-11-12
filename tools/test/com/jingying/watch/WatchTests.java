@@ -1279,7 +1279,7 @@ public final class WatchTests {
     private static void speedBoost() {
         SpeedNav nav = new SpeedNav();
         eq("目标倍速 2×", 2f, SpeedNav.BOOST);
-        eq("第一次用带 pitch 的写法", 0, nav.variant());
+        eq("第一次沿用播放器当前参数（官方推荐写法）", 0, nav.variant());
         check("新一次长按立刻就能试", nav.shouldAttempt(0));
         check("还没试过不算失败", nav.failures() == 0 && !nav.unsupported());
         eq("长按提示", "2× 播放中", nav.label());
@@ -1361,6 +1361,13 @@ public final class WatchTests {
         check("等满 700ms 再测", probe.shouldProbe(1_400));
         check("两轮都对不上才下结论", probe.suspect(1_400, 2_300));
         check("确认后标记可疑", probe.suspected());
+
+        // 确认没加速也别直接跳帧：先给一次重建播放器的机会（华为等机型首次设置不生效）
+        check("还能重建播放器", probe.canRebuild());
+        probe.markRebuilt();
+        check("重建过就不再重复重建", !probe.canRebuild());
+        probe.reset();
+        check("新一次长按又能重建", probe.canRebuild());
 
         // ---- 跳帧兜底 ----
         SpeedNav seek = new SpeedNav();

@@ -196,6 +196,8 @@ public final class FeedPage extends FrameLayout {
     private boolean speedBoost;
     /** 倍速的重试策略（写法降级 + 退避 + 什么时候才叫不支持）。 */
     private final SpeedNav speedNav = new SpeedNav();
+    /** 为倍速重建播放器后要回到的位置，-1 表示不用回。 */
+    private long resumeAtMs = -1L;
     private boolean previewMode;
     private boolean hostResumed = true;
     private int videoWidth;
@@ -623,6 +625,7 @@ public final class FeedPage extends FrameLayout {
         detailsRequested = false;
         playAttempts = 0;
         speedBoost = false;
+        resumeAtMs = -1L;
         speedNav.reset();
         musicPrepared = false;
         visualReady = false;
@@ -1049,12 +1052,33 @@ public final class FeedPage extends FrameLayout {
                 videoWidth = mediaPlayer.getVideoWidth();
                 videoHeight = mediaPlayer.getVideoHeight();
                 applyVideoTransform();
+                final boolean resumed = resumeAtMs > 0;
+                if (resumed) {
+                    // 为倍速重建过播放器：先回到原来的位置，别让画面跳回开头
+                    long duration = mediaPlayer.getDuration();
+                    long at = duration > 0 ? Math.min(resumeAtMs, Math.max(0L, duration - 500)) : resumeAtMs;
+                    try {
+                        mediaPlayer.seekTo((int) Math.max(0L, at));
+                    } catch (Exception ignored) {
+                    }
+                    resumeAtMs = -1L;
+                }
                 if (role == 0 && !userPaused && hostResumed) {
                     // 先设倍速再 start：部分机型只有在 Prepared 状态设置才真正生效。
                     // 新播放器 = 新引擎，把上一次的失败计数清掉重新给机会
                     if (speedBoost) {
                         speedNav.restart();
-                        applySpeed(SpeedNav.BOOST);
+                        if (resumed) {
+                            // seek 是异步的，等落点稳定再设：否则实测基准会被「位置从 0
+                            // 跳到原处」这一步污染，明明没加速也会算成加速
+                            handler.postDelayed(() -> {
+                                if (!pageDestroyed && player == mediaPlayer) {
+                                    applySpeed(SpeedNav.BOOST);
+                                }
+                            }, 300L);
+                        } else {
+                            applySpeed(SpeedNav.BOOST);
+                        }
                     }
                     mediaPlayer.start();
                     playing = true;
@@ -2047,31 +2071,46 @@ public final class FeedPage extends FrameLayout {
                     + speedNav.failures() + " 次）：" + exc
                     + " playing=" + playing + " prepared=" + prepared + " surface=" + (surface != null));
             if (speedNav.wantsSeek()) {
-                android.util.Log.i("JYWatch", "参数写法连续失败 " + speedNav.failures() + " 次，改走跳帧倍速");
-                startSeekBoost(now);
+                if (speedNav.canRebuild()) {
+                    // 和实测失败一样，先给一次重建播放器的机会，别直接掉到有损的跳帧
+                    speedNav.markRebuilt();
+                    rebuildForSpeed(positionMs());
+                } else {
+                    android.util.Log.i("JYWatch", "参数写法连续失败 " + speedNav.failures()
+                            + " 次且已重建过，改走跳帧倍速");
+                    startSeekBoost(now);
+                }
             }
         }
         refreshSpeedLabel();
     }
 
     /**
-     * 三种写法依次降级：
-     * 0 带 pitch（最常见也最容易被拒）/ 1 只给 speed / 2 沿用播放器当前参数只改速度。
+     * 三种写法依次降级。
+     *
+     * <p>顺序很关键：<b>先沿用播放器当前的参数对象只改速度</b>。
+     * 官方文档和 AOSP 示例都是 `mp.setPlaybackParams(mp.getPlaybackParams().setSpeed(x))`，
+     * 因为这个对象里带着引擎已初始化的内部模式（audio fallback / sync engine）；
+     * 而 `new PlaybackParams()` 是个干净对象，部分机型会**接受但不执行**——
+     * 不抛异常、`getPlaybackParams()` 也回报 2.0，画面却还是原速。
+     * 之前把这个写法排在最后，等于永远试不到它，这就是「提示 2× 画面原速」的根因之一。</p>
+     *
+     * <p>0 沿用当前参数 + 保持音调 / 1 新建带 pitch / 2 新建只给 speed。</p>
      */
     private PlaybackParams buildSpeedParams(int variant) {
-        if (variant >= 2) {
+        if (variant <= 0) {
             try {
                 PlaybackParams current = player.getPlaybackParams();
                 if (current != null) {
-                    return current.setSpeed(SpeedNav.BOOST);
+                    return current.setSpeed(SpeedNav.BOOST).setPitch(1f);
                 }
             } catch (Exception ignored) {
             }
         }
-        if (variant == 1) {
-            return new PlaybackParams().setSpeed(SpeedNav.BOOST);
+        if (variant <= 1) {
+            return new PlaybackParams().setSpeed(SpeedNav.BOOST).setPitch(1f);
         }
-        return new PlaybackParams().setSpeed(SpeedNav.BOOST).setPitch(1f);
+        return new PlaybackParams().setSpeed(SpeedNav.BOOST);
     }
 
     /** 松手恢复 1×。恢复失败无所谓，也不该影响「支持 / 不支持」的判定。 */
@@ -2111,7 +2150,15 @@ public final class FeedPage extends FrameLayout {
                 android.util.Log.i("JYWatch", "倍速实测可疑（700ms 只走了 " + pos + "ms），再测一轮");
                 return;
             }
-            android.util.Log.w("JYWatch", "两轮实测都没加速（位置 " + pos + "ms），改走跳帧");
+            android.util.Log.w("JYWatch", "两轮实测都没加速（位置 " + pos + "ms）");
+            if (speedNav.canRebuild()) {
+                // 有些机型第一次设倍速就是不生效，重建播放器再设才行（比重写引擎便宜，
+                // 也比跳帧平滑），所以排在跳帧前面
+                speedNav.markRebuilt();
+                rebuildForSpeed(pos);
+                return;
+            }
+            android.util.Log.w("JYWatch", "重建后仍不生效，改走跳帧");
             startSeekBoost(now);
             return;
         }
@@ -2125,6 +2172,39 @@ public final class FeedPage extends FrameLayout {
         } catch (Exception ignored) {
         }
         applySpeed(SpeedNav.BOOST);
+    }
+
+    /**
+     * 为倍速重建播放器：释放当前实例，从原来的位置重新 prepare。
+     *
+     * <p>华为等机型的已知行为：第一次 {@code setPlaybackParams} 不生效——不抛异常、
+     * {@code getPlaybackParams()} 也回报 2.0，画面却是原速；把 MediaPlayer 释放重建、
+     * 重新 prepare 之后再设就正常了。代价是短暂重新加载，换回来的是真正平滑的 2×，
+     * 比跳帧好得多，所以排在跳帧前面。</p>
+     */
+    private void rebuildForSpeed(long positionMs) {
+        if (pageDestroyed || work == null) {
+            return;
+        }
+        android.util.Log.i("JYWatch", "为倍速重建播放器（回到 " + positionMs + "ms）");
+        resumeAtMs = Math.max(0L, positionMs);
+        if (player != null) {
+            try {
+                player.stop();
+            } catch (Exception ignored) {
+            }
+            try {
+                player.release();
+            } catch (Exception ignored) {
+            }
+            player = null;
+        }
+        prepared = false;
+        playing = false;
+        settingUp = false;
+        coverHidden = false;
+        showLoading(true);
+        prepareVideo();
     }
 
     /**
@@ -2413,6 +2493,7 @@ public final class FeedPage extends FrameLayout {
         visualReady = false;
         albumPaused = false;
         speedBoost = false;
+        resumeAtMs = -1L;
         speedNav.reset();
         handler.removeCallbacks(albumTicker);
         handler.removeCallbacks(visualFallback);
