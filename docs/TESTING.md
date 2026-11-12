@@ -1712,3 +1712,437 @@ PASS 113 / FAIL 0
 - 本轮**未动**翻页吸附结束帧 `bindSlots()` 的三次 `bind()`（含同步
   `MediaPlayer.release()`）。如果卡顿发生在「上下滑翻到图集」而不是「左右切图」，
   那是另一条路径，需要单独处理。
+
+## 第四十五轮：详情里显示本地文件目录（2026-11-12）
+
+### 需求
+播放页「详情」弹层里，作品若已下载到本地，就把本地文件目录一起显示出来。
+
+### 实现
+- 新增 `LocalFiles.java`（纯 Java、可单测）：
+  - `isDownloaded(dir)`：`meta.json` 完成标记 + 至少一个作品文件才算已下载。
+    `OfflineStore` 只在下载成功后原子写 `meta.json`，下载中的 `*.part` / `*.tmp`
+    和下载失败被清空的目录都不会被误判，也不会指向一个空壳路径。
+  - `files(dir)`：排除 `meta.json`、隐藏文件、`.part` / `.tmp`、子目录，按文件名排序，
+    保证同一个作品每次打开看到的顺序一致。
+  - `listing(dir, maxLines)`：`文件名  ·  大小`，超过上限折成「… 还有 N 个文件」，
+    避免几十张图的图集把详情弹层顶满屏。
+- `FeedActivity.showInfo()` 在「片库路径」下方，命中已下载时追加：小标题、目录绝对路径
+  （点按复制、长按可选中）、最多 6 行文件清单；未下载时整段不渲染，弹层高度不变。
+- 目录由 `app.offline.dirFor(work)` 取得（`offline/w<sha1(rel)[:16]>/`），直接读文件系统
+  而不是 `has()` 内存索引，下载刚结束 / 刚删除都能立刻反映，也不受后台 load 时序影响。
+
+### 验证
+- 新增「详情里的本地文件目录」24 项：null / 不存在 / 空目录 / 下载中 / 只剩标记 /
+  正常完成、杂物过滤与排序、清单行数与折叠、中文名与 0 字节文件。
+  单元测试 **PASS 248 / FAIL 0**（原 224）。
+- `android\build.ps1 -NoBump -Test`：资源编译 → javac → d8 → 打包 → apksigner 全绿。
+- 最终 `android\build.ps1 -Test` 同样全绿，版本号按脚本惯例自增到
+  **v1.0.25（code 35）**，产物 `android/JingYing-Watch-v1.0.25.apk`。
+- 改动前 5 个文件备份在 `%TEMP%\jingying-watch-backup-20261112\localdir-20261112\`。
+
+### 待真机验证
+- 已下载作品打开详情能看到目录 + 文件清单，点按路径提示「本地目录已复制」；
+- 下载中 / 下载失败的作品不显示这一段；
+- 几十张图的图集弹层不顶满屏、删除离线文件后这一段消失。
+
+## 第四十六轮：双击收藏误暂停与心心太小（2026-11-12）
+
+### 问题
+1. 双击收藏「有概率」顺带把作品暂停了；
+2. 双击冒出来的心心太小（基准边长约 22dp），几乎看不清。
+
+### 根因（问题 1）
+`FeedPager` 把双击判定放在 `ACTION_UP`，而「单击延迟」和「双击窗口」共用同一个
+`DOUBLE_TAP_TIMEOUT_MS = 260`。两下间隔刚好跨过 260ms 边界时，第一下待执行的
+`onTap(HIT_NONE)`（暂停）已经触发，第二下才来判定，于是收藏没生效、画面却被暂停。
+另外用「两次抬手」算间隔，比用户感知的双击多算了一个按压时长，本来就偏严。
+
+### 修复
+- 新增 `TapNav.java`（纯 Java 可单测）：`DOUBLE_TAP_WINDOW_MS = 260`（判定基准：
+  上次抬手 → 这次按下），`SINGLE_TAP_DELAY_MS = 280`（**严格大于窗口**，保证判定成立时
+  待执行的单击还没到点），`isDoubleTap()` 统一时间 / 位移 / pending 三个条件。
+- `FeedPager.ACTION_DOWN` 就判定第二下并立刻 `cancelPendingSingleTap()`；即使第二下
+  按到按钮 / 话题上也要撤，避免第一下在双击期间暂停。同时不再排长按回调。
+- `ACTION_UP` 命中双击直接 `onDoubleTap` 并 return，绝不新排一个会暂停的单击；
+  落在按钮 / 话题上仍按普通单击处理。`handleTap` 只负责延迟单击，不再自己判双击。
+- `FeedPage` 把话题命中抽成无副作用的 `captionTokenAt()` / `hasCaptionTokenAt()`，
+  双击判定用它排除话题文字，保留原有的话题点击语义。
+- `HeartBurstView`：基准边长 22dp → **96dp**（动画峰值约 120dp），三颗心的横向散开
+  10/11dp → 34/36dp，上浮 26dp → 64dp，时长 780ms → 900ms；连续双击加了 15 个上限。
+
+### 验证
+- 新增「双击判定与单击延迟」15 项：不变式「延迟 > 窗口」、窗口边界 ±1ms、
+  位移 slop 边界、慢双击、时间倒流、pending 已执行过不算。
+  单元测试 **PASS 263 / FAIL 0**（原 248）。
+- `android\build.ps1 -NoBump -Test`：资源编译 → javac → d8 → 打包 → apksigner 全绿。
+- 最终 `android\build.ps1 -Test` 同样全绿，版本号按脚本惯例自增到
+  **v1.0.26（code 36）**，产物 `android/JingYing-Watch-v1.0.26.apk`。
+- 改动前 7 个文件备份在 `%TEMP%\jingying-watch-backup-20261112\doubletap-20261112\`。
+
+### 待真机验证
+- 连续双击 20 次，播放状态不应被改变（不出现暂停 / 继续闪动）；
+- 稍慢的双击也能识别为收藏；单击暂停的手感（280ms）是否可接受；
+- 心心大小、三颗散开的效果、靠近屏幕边缘时是否被裁切。
+
+## 第四十七轮：自动连播开关（2026-11-12）
+
+### 背景
+`Prefs` 里早就有 `auto_next`（默认 `true`）和 `setAutoNext()`，但全项目没有任何 UI 入口，
+等于永远开启。`FeedActivity.onCompleted()` 直接读 `prefs.autoNext()`，
+连 `FeedPage.prepareVideo()` 里「边播边缓存当前视频」也挂在同一个条件上。
+
+### 改动
+- 设置页新增「播放」分组：CheckBox「播放结束后自动连播下一个」。勾选即写
+  `prefs.setAutoNext()`，**立即生效**，不用点「保存并扫描」（那套只保存 WebDAV 连接）；
+  说明文字写清关掉后是「停在当前作品、轻点重播，上下滑动仍可自己翻」。
+- 新增 `PlayNav.java`（纯 Java 可单测）：`TOUCH_GRACE_MS = 900`，
+  `afterEnded(autoNext, hasNext, sinceLastTouchMs)` 返回 `IGNORE / NEXT / REPLAY`。
+  三段规则的**顺序**是重点：先判「刚滑过就不动」，再判「连播开且有下一条」，其余停住。
+- `FeedActivity.onCompleted()` 改为调用 `PlayNav`，并补 `pager == null` 兜底
+  （原代码在 `pager.lastTouchAt()` 前没有判空）。
+- `FeedPage.prepareVideo()` 的边播边缓存去掉 `autoNext()` 条件：它预取的是
+  **当前作品自己的**视频（`work.video`），与下一个作品无关；否则关掉连播会连带
+  让当前视频不再补缓存，回滑重播更容易卡。
+
+### 范围说明
+这个开关只控制**作品之间**的自动切换。图集内部的 3.2 秒自动轮播不受影响
+（那是图集本身的播放形式，相当于视频在播放）。如果也需要「图集停在最后一张」，
+要单独加开关，本轮没做。
+
+### 验证
+- 新增「播完去向与自动连播」11 项：四种「开关 × 有无下一条」组合、
+  900ms 边界 ±1ms、刚抬手 0ms、时钟回退负值、宽限内即使关了连播也不重播、
+  常量不变式（宽限为正、三种去向互不相同）。
+  单元测试 **PASS 274 / FAIL 0**（原 263）。
+- `android\build.ps1 -NoBump -Test`：资源编译 → javac → d8 → 打包 → apksigner 全绿；
+  确认 `com/jingying/watch/PlayNav.class` 已进 `classes.jar`。
+- 最终 `android\build.ps1 -Test` 同样全绿，版本号按脚本惯例自增到
+  **v1.0.27（code 37）**，产物 `android/JingYing-Watch-v1.0.27.apk`。
+- 改动前 7 个文件备份在 `%TEMP%\jingying-watch-backup-20261112\autonext-20261112\`。
+
+### 待真机验证
+- 关闭开关：视频播完停在最后一帧、显示播放按钮，轻点从头重播，**不会**自动翻页。
+- 打开开关：播完自动滑到下一个；最后一条停在当前屏。
+- 杀进程重开 App，设置页勾选状态仍保留（写的是 SharedPreferences）。
+- 刚滑过 900ms 内上一条刚好播完，不应把用户顶走。
+
+## 第四十八轮：手动切过图集后不再自动轮播（2026-11-12）
+
+### 问题
+图集轮播是 3.2 秒的 `albumTicker`，原本只受 `albumPaused`（点按暂停）、`role`（是否当前屏）、
+`hostResumed`（前台）控制。用户左右滑切图只改了 `albumIndex`，**没有影响定时器** ——
+刚手动滑到想看的那张，3.2 秒后照样被带走，等于手动操作白做。
+
+### 改动
+- `AlbumNav` 新增 `shouldAutoAdvance(manual, paused, imageCount, activePage, hostResumed)`：
+  把原来分散在 `scheduleAlbumTicker()` 和 `albumTicker.run()` 里的两套条件收敛成一个纯函数，
+  新增的 `manual` 优先级最高。
+- `FeedPage` 新增 `albumManual`：
+  - `advanceAlbum()` / `previousAlbum()`（手势切图，含抬手快扫兜底）先 `markAlbumManual()`，
+    立刻 `removeCallbacks(albumTicker)`；
+  - `bind()` 里重置 `albumManual = false` 并撤掉上一轮 ticker —— 只影响被手动接管的那一个作品，
+    换到别的作品重新开始轮播。
+- 因为判断统一了，所有「重新排轮播」的入口自动继承新规则：`pauseAlbum()` / `resumeAlbum()`、
+  `setRole(0)`、`onAlbumTouchUp()`、`resume()`。手动接管后再点暂停/继续只恢复音乐，
+  不会把定时切图带回来。
+
+### 验证
+- 「图集切图与预取」新增 10 项（该组共 33 项）：默认会轮播、手动切过不轮播、
+  手动 + 暂停、手动 + 单张、暂停、单张、空图集、非当前屏、后台、换作品重置后恢复。
+  单元测试 **PASS 284 / FAIL 0**（原 274）。
+- `android\build.ps1 -NoBump -Test`：资源编译 → javac → d8 → 打包 → apksigner 全绿。
+- 最终 `android\build.ps1 -Test` 同样全绿，版本号按脚本惯例自增到
+  **v1.0.28（code 38）**，产物 `android/JingYing-Watch-v1.0.28.apk`。
+- 顺手修掉 README 里 5 处历史遗留的字面 `\n`（渲染时会原样显示成 `\n`）。
+- 改动前 5 个文件备份在 `%TEMP%\jingying-watch-backup-20261112\albumanual-20261112\`。
+
+### 待真机验证
+- 自动轮播中左右滑一张，之后不再自动切；滑走再滑回同一作品仍保持手动。
+- 手动切过后点暂停再点继续：背景音乐恢复，但不会恢复自动轮播。
+- 换到另一个图集作品：自动轮播正常重新开始。
+- 没手动碰过的图集仍然 3.2 秒自动轮播。
+
+## 第四十九轮：作品链接可打开 + 图集实况动图（2026-11-12）
+
+### 问题
+1. 「详情 → 复制链接」复制的是 `文案.txt` 里「作品链接：」后面的**整行文本**。
+   那一行如果是抖音分享口令（`7.89 复制打开抖音，看看… https://v.douyin.com/xxx/ 复制此链接…`），
+   整段粘到抖音里识别不出来；如果是 `www.douyin.com/video/<id>`，在未登录的浏览器里
+   只显示「打开抖音观看」，用户体感就是「链接打不开」。
+2. 图集里的实况 / 动图（电脑版存成 `动图_01.mp4`，与 `图片_01.jpg` 同序号）从来没被播放过：
+   `Work.applyFiles()` 早就把这类文件归到 `lives`，但 `FeedPage` 只读 `images`，
+   `OfflineStore` 也明确「实况图 lives 不下载」。所以动图作品永远只有一张静态照片。
+
+### 改动
+- `DouyinLinks`：
+  - `clean(raw)` 用正则从任意分享口令里抽出第一个 http(s) 链接并去掉尾部中英文标点；
+  - `workUrl(id, album, raw)`：`v.douyin.com` / `iesdouyin.com/share` 短链原样保留；
+    否则按作品 ID 拼 `https://www.douyin.com/video/<id>`（图集 `/note/<id>`，
+    原链接已写 `/note/` 时沿用）；都没有就退回抽出来的 URL；
+  - `workScheme(id)`：`snssdk1128://aweme/detail/<id>`，只接受 6~32 位纯数字。
+- `DouyinLauncher.openWork()`：先 scheme 点名抖音 / 抖音 Lite，失败再点名包名打开网页链接，
+  最后才交给系统；都失败给明确提示。
+- `FeedActivity.showInfo()`：按钮改成两行（四个 pill 一行放不下）——
+  「作者主页 · 抖音打开」/「复制链接 · 关闭」；复制的内容换成 `workUrl()` 的结果。
+- `Work.liveFor(index)`：按文件名里的第一段数字配对 `图片_NN` ↔ `动图_NN`；
+  旧包没有序号时，动图数量与图片一致才按下标配，数量不符就当没有（宁可静态图，不瞎配）。
+- `FeedPage`：新增独立的 `livePlayer`（复用同一个 TextureView，不动视频作品的
+  `player` 状态）：
+  - 静态图先上屏，动图准备好并真正开始出画面后（INFO 回调 + 250ms 轮询位置，
+    部分 ROM 不发 `MEDIA_INFO_VIDEO_RENDERING_START`）再把静态图淡出；
+  - 动图循环播放、**静音**（背景音乐在另一条播放器上）；播放器按 contain 变换，
+    和静态图的 FIT_CENTER 一致，切换时不跳比例；
+  - 暂停 / 继续、切屏（`setRole`）、前后台、换作品都会同步暂停或释放；
+    动图读不到、解包失败、播放报错时静默退回静态图，不会黑屏或卡住轮播；
+  - 没有动图的图集完全不进这套逻辑（`stopAlbumLive()` 在 `hadLive == false` 时直接返回，
+    否则会把切图时的 1.015 倍呼吸动画取消在半路，图片卡在放大状态）。
+- `OfflineStore`：`downloadBytes()` 与下载循环都带上 `lives`；单张动图下载失败只跳过它，
+  不让整个作品下载失败。新增 `localLive(work, index)`。
+
+### 验证
+- 新增「图集动图配对」14 项：01/02/03 三张图只配 01、03 两个动图；越界 / 负数返回 null；
+  动图计入 `totalBytes()`；没有动图的图集；旧包无序号（数量一致按下标配）；
+  数量不符不硬配。
+- 「抖音链接」组从 5 项扩到 19 项：分享口令抽 URL、尾部中文标点、无链接 / null、
+  短链保留、按 ID 拼视频 / 图文链接、原链接是 `/note/` 时沿用、无 ID 退回原链接、
+  deep link 拼装与纯数字校验（`abc` / `123` 拒绝）。
+- 单元测试 **PASS 311 / FAIL 0**（原 284）。
+- `android\build.ps1 -NoBump -Test` 与最终 `android\build.ps1 -Test` 全绿，
+  版本自增到 **v1.0.29（code 39）**，产物 `android/JingYing-Watch-v1.0.29.apk`。
+- 改动前 7 个文件备份在 `%TEMP%\jingying-watch-backup-20261112\livelink-20261112\`。
+
+### 待真机验证
+- 有文案.txt 且带分享口令的作品：复制出来只有一条干净链接，粘到抖音能识别。
+- 「抖音打开」直接进抖音作品页（不弹浏览器）；卸载抖音后点击应有明确提示。
+- 实况图集：切到有动图的那张会动，背景音乐不中断；没有动图的那张保持静态。
+- 下载带动图的图集后再看，飞行模式下动图仍能播（`动图_NN.mp4` 在本地目录里）。
+- 手动切图 / 暂停 / 切后台再回来：动图跟着停、跟着恢复，不出现「画面黑但音乐在响」。
+
+## 第五十轮：部分作品的「文案」其实是一串作品 ID（2026-11-12）
+
+### 问题
+v1.0.23 只处理了「空文案 → 别拿目录名 / tar 文件名冒充」，但**有文案的作品**里还有一类：
+电脑版 `downloader._write_caption()` 在作品标题为空时用 `info.display_title()` 兜底，
+而 `models.display_title()` 返回的是 `"抖音作品 " + aweme_id`。于是 文案.txt 落成
+
+    文案：
+    抖音作品 7525082444551310602
+
+Android 解析后 `captionText` 非空、`hasCaption()` 为真，播放页底部和详情弹层原样显示
+这串 ID。旧包里还有直接写成纯数字的版本。**这是「部分作品」的由来：只有下载时确实没有
+文案的那些作品才会中招。**
+
+### 改动
+- `Work.looksLikeWorkId()` 扩成「机器生成的作品标识」判定：
+  - 先剥掉占位前缀（`抖音作品` / `作品ID` / `作品id` / `作品编号` / `aweme_id`，大小写不敏感，
+    可连续剥），再只允许首尾出现 `:：-_#.、` 这类装饰字符；
+  - 剥完必须全是数字；带前缀的放宽到 1~32 位（`抖音作品 0` 也算占位），纯数字仍要求 6~32 位；
+  - 中间夹了别的字符一律当正常文案（`<id>_20260101`、`<id> 的旅行日记` 都不会误杀）；
+  - 只有「第一行是 ID、其余行全空」才按占位处理；多行文案（哪怕第一行是 ID）不碰。
+- `Work.hasCaption()` 复用这个判定：占位文案 = 没有文案 → 播放页整行 `GONE`、
+  `displayTitle()` 回退 `@作者 的作品`。**已存进索引 JSON 的旧条目也一起修好**（读时过滤）。
+- `Work.parseCaptionText()`：解析出占位文案时把 `captionText` 落成空串，不再写进索引 / 数据。
+- `FeedActivity.showInfo()`：详情弹层原来直接读裸的 `work.captionText`，现在改用
+  `work.captionLine()`，占位文案在详情里也不再出现。
+
+### 验证
+- 「空文案不显示作品 ID」组从 23 项扩到 43 项：新增 `抖音作品 <id>`（有/无空格）、
+  `作品ID：`、`作品id: `（小写）、尾随换行、占位后跟真文案（不算占位）、
+  正文里带数字（不误杀）、短数字带前缀；以及三条完整链路——已存盘对象、
+  `parseCaptionText()` 解析占位（含旧包纯 ID）、`captionLine()` / `displayTitle()` 输出。
+- 单元测试 **PASS 328 / FAIL 0**（原 311）。
+- `android\build.ps1 -Test` 全绿，版本自增到 **v1.0.30（code 40）**，
+  产物 `android/JingYing-Watch-v1.0.30.apk`。
+- 改动前 3 个文件备份在 `%TEMP%\jingying-watch-backup-20261112\idcaption-20261112\`。
+
+### 待真机验证
+- 之前底部显示「抖音作品 752508…」的作品：文字整行消失，标题变 `@作者 的作品`。
+- 详情弹层里同一批作品不再出现那行 ID，但「作品链接」仍是完整抖音链接。
+- 文案是正常文字（哪怕带数字、带话题）的作品显示不受影响。
+
+### 遗留（没动）
+- 电脑版 `downloader._write_caption()` 仍会把「抖音作品 <id>」写进 文案.txt，
+  只是 Android 现在读的时候会过滤。要根治得改 PC 端并把 exe 重新打包，
+  否则新建的 tar / 文件夹里的 文案.txt 仍带这行占位。
+
+## 第五十一轮：图集划过后仍是第一张 + 长按提示「倍速不可用」（2026-11-12）
+
+### 问题一：图集滑动切换后有概率依旧显示第一张
+三条独立的成因，都会表现成「划了没切 / 还是第一张」：
+
+1. **快速轻扫被当成点击**。横滑只在 `ACTION_MOVE` 里靠「位移越过 touchSlop」进入
+   `albumSwipe` 模式；MOVE 被系统合并、只剩 DOWN/UP 时这个判定根本没跑，
+   抬手后落到 `handleTap()` —— 图集被暂停，画面还停在第 1 张。
+   竖直方向一直有这种「抬手补翻页」的兜底，横向没有。
+2. **图片加载失败没有任何补救**。`showAlbumImage()` 的回调在 `bitmap == null` 时直接
+   return：画面停在上一次（通常就是第 1 张），角标却已经跳到「图集 2/3」，
+   既不提示也不会自愈。WebDAV 超时 / 一次性链接失效都算这一类。
+3. **重新 prepare 时写死回第 1 张**。`prepareAlbum()` 里是 `showAlbumImage(0, ...)`；
+   页面被释放过（滑到别的作品再滑回来）又 `setRole(0)` 时会重新 prepare，
+   用户刚切到的第 N 张会被打回第 1 张。
+
+### 问题二：长按提示「倍速不可用」
+`setSpeedLabel()` 只在长按按下的那一瞬间算一次文案：
+`show && speedFailures > 0 ? "倍速不可用" : "2× 播放中"`。而 `applySpeed()` 在
+「刚 start、正在缓冲、seek 之后」这些时机调用 `setPlaybackParams()` 很容易抛
+`IllegalStateException`（真不支持变速的机器 / 编码才会一直抛）。于是：
+
+- 第一次失败 → 标签立刻写成「倍速不可用」；
+- 之后 `keepSpeed()` 每帧补设，其实可能 200ms 后就成功了，但标签**不会更新**；
+- 反过来，如果当时 `player == null`（还没 prepare），`applySpeed()` 静默 return，
+  标签却显示「2× 播放中」，同样是假话。
+
+### 改动
+- `AlbumNav.swipeDirection(dx, dy, duration, width)`：纯函数，返回 +1 / -1 / 0。
+  横向位移要压过纵向 15%，并且「位移超过 8% 屏宽」或「快速轻扫（5% + 300px/s）」满足其一才切图。
+- `FeedPager.ACTION_UP`：在竖直兜底之前加图集横滑兜底（进度条区域、正在拖动、
+  已经进入 `horizontalGesture` 的分支都不参与）。
+- `FeedPage.showAlbumImage()` 拆出 `loadAlbumImage()`：失败按 400/800/1200ms 退避重试 3 次，
+  仍失败且是当前屏时提示「这一张图读取失败，已自动重试」；新增 `albumLoadToken`，
+  切图时自增，旧的加载 / 重试回调一律作废（不会把上一张画回来）。
+- 切到「没有配对动图」的那一张时立刻 `stopAlbumLive()`：否则上一张的动图会继续在
+  同一块 TextureView 上循环，静态图还是旧的，看起来就是「切了没反应」。
+- `prepareAlbum()` 改用当前 `albumIndex`，不再写死 0（换作品时 `bind()` 已经清 0）。
+- 倍速：新增 `speedApplied` 状态 + `speedRetry` 退避重试（350ms×次数，最多 3 次）；
+  `applySpeed()` 在「未 prepare」时不再记失败；`setSpeedLabel()` / `refreshSpeedLabel()`
+  按真实状态出文案（2× 播放中 / 这个视频不支持倍速），重试成功会自己变回来。
+
+### 验证
+- 「图集切图与预取」组 33 → 40 项：左划 / 右划方向、纵向为主不切、斜 45° 不切、
+  位移不足且慢不切、快速小位移补切、宽度为 0。
+- 单元测试 **PASS 335 / FAIL 0**（原 328）。
+- `android\build.ps1 -Test` 全绿，版本自增到 **v1.0.31（code 40 → 41）**，
+  产物 `android/JingYing-Watch-v1.0.31.apk`。
+- 改动前 4 个文件备份在 `%TEMP%\jingying-watch-backup-20261112\albumspeed-20261112\`。
+
+### 待真机验证
+- 图集：快速轻扫一下就应该切图（不能变成暂停）；慢速拖动超过 8% 屏宽也切。
+- 图集：网络差时切图会短暂停在上一张，1~2 秒内自己补上；实在读不出来才弹提示。
+- 滑到别的作品再滑回同一个图集，仍停在刚才那一张（不回到第 1 张）。
+- 视频：刚起播就长按，提示先显示「2× 播放中」并真的变速；只有连续 3 次失败
+  （真不支持的编码/机型）才显示「这个视频不支持倍速」。
+- 长按松手后速度必须回到 1×，提示消失。
+
+## 第五十二轮：长按提示「这个视频不支持倍速」的真正来源（2026-11-12）
+
+### 问题
+上一轮只是把文案从「倍速不可用」改成按状态刷新，**没有解决失败本身**，所以这轮用户看到的
+是新文案「这个视频不支持倍速」。而这句话其实不是任何能力探测的结果，就是我们自己的计数器
+凑满了 —— 复盘出来四条：
+
+1. **失败的时机多半根本不该算失败**。旧代码只判断 `player != null && prepared`，
+   但视频轨没有 Surface（`surface == null`）时 NuPlayer 的渲染器为空，
+   `setPlaybackParams()` 必定返回 INVALID_OPERATION（Java 侧是 IllegalStateException）。
+   页面刚建好、TextureView 被回收重建、切页回来这一小段时间都会这样。
+2. **keepSpeed 每 220ms 又撞一次，和退避重试叠着数**。ticker 每 220ms 调一次
+   `updateProgress()` → `keepSpeed()` → 失败就 `speedFailures++`，而 retry 又按
+   350/700/1050ms 再补两刀。于是「3 次失败」其实在 0.6~1 秒内就凑满了，
+   一次缓冲抖动就能把结论定死。
+3. **凑满就永久放弃**。`keepSpeed()` 里 `speedFailures >= SPEED_MAX_FAILURES` 直接 return，
+   之后不管缓冲结束、Surface 就绪还是重新起播都不再试，标签钉死在那句话上。
+4. **只有一种参数写法**。`new PlaybackParams().setSpeed(2f).setPitch(1f)` 一被拒就没有第二次机会，
+   而部分 ROM 恰恰是对显式 pitch / fallback 模式不认的。
+
+真正「这台机器 / 这个编码不支持变速」确实存在（视频没有音轨时时间拉伸没有载体），
+但那类情况应该是**连续试满几秒**之后才下的结论，不是 0.3 秒。
+
+### 改动
+- 新增纯 Java 类 `SpeedNav`（可单测），只描述策略，不碰 MediaPlayer：
+  - 三种参数写法按失败顺序降级：`0` speed+pitch / `1` 只给 speed /
+    `2` 沿用 `getPlaybackParams()` 再只改 speed；
+  - 退避 300 / 600 / 900 / 1200 / 1500 / 1800ms，累计 **6.3 秒**，
+    连续失败 `MAX_FAILURES = 6` 次才 `unsupported()`；
+  - `restart()`（缓冲结束、首帧、Surface 就绪、重新起播）只清失败计数、保留已经试出来的写法；
+    `reset()`（新一次长按、换播放器）全部清零；
+  - `shouldAttempt(now)` 做节流，同一个退避窗口内不允许重复设置。
+- `FeedPage`：
+  - `applySpeed()` 拆成「判定能不能试」+「真的设一次」：`player == null`、`!prepared`、
+    `surface == null` 一律**直接返回且不记失败**；
+  - `keepSpeed()` 不再各自计数，只负责发现「被打回 1×」再走 `applySpeed()`，
+    节流交给 `SpeedNav`；
+  - `restoreSpeed()` 单独一条路径（松手回 1×），失败也不影响判定；
+  - `onPrepared` / `onInfo(BUFFERING_END、RENDERING_START)` / `onSurfaceTextureAvailable`
+    都会 `speedNav.restart()` 后补设一次 —— Surface 就绪这条是原来完全没有的；
+  - 提示文案：`"2× 播放中"` / 真试满上限才 `"本机不支持倍速"`（`SpeedNav.label()`）。
+
+### 验证
+- 新增「长按倍速重试」28 项：三种写法降级与封顶、退避 300→1800 递增、
+  节流窗口内不重复设置、成功后计数清零、差一次不算不支持、试满才判不支持且不再尝试、
+  累计退避 ≥ 5 秒（实测 6300ms）、`restart()` 清计数保留写法、`reset()` 回归第一种写法、
+  低版本 `giveUp()` 直接判不支持。
+- 单元测试 **PASS 363 / FAIL 0**（原 335）。
+- `android\build.ps1 -Test` 全绿，版本自增到 **v1.0.32（code 42）**，
+  产物 `android/JingYing-Watch-v1.0.32.apk`。
+- 改动前 4 个文件备份在 `%TEMP%\jingying-watch-backup-20261112\speedfix-20261112\`。
+
+### 待真机验证
+- 正常视频长按：立刻 2×，松手回 1×，不会再闪一句「不支持」。
+- 视频刚开始缓冲时长按：先「2× 播放中」，缓冲结束后倍速自动补上；仍失败也只在
+  持续按住 6 秒以上时才提示「本机不支持倍速」。
+- 松手再长按：重新从第一种写法开始试（不会因为上次失败就不试）。
+- 如果某台机器 / 某个视频确实不支持，logcat 里能看到
+  `setPlaybackParams 失败（写法 x，第 n 次）` 和具体异常，据此可判断是
+  IllegalStateException（状态 / 无渲染器）还是 IllegalArgumentException（参数不被支持）。
+
+## 第五十三轮：搜索框删字不正常 + 随机观看被搜索词限死（2026-11-12）
+
+### 问题一：搜索框删除文字不正常
+`HomeActivity` 的搜索框只做了「停手 220ms 再筛」，其余全靠输入法自觉，于是：
+
+1. **拼音还没上屏就去筛**。中文输入法在选词前把拼音字母写进 EditText（composing 状态），
+   这时文本是 `luying` 这种字母串；220ms 一到就拿它去 `Library.filter`，结果必然是
+   「没有匹配的作品」。删中文字时输入法也会先退成拼音，列表跟着一会儿空一会儿有，
+   看起来就是「删字时列表乱跳」。
+2. **删空还要等一个防抖**。删到空之后 `query` 仍是旧值，列表要到 220ms 后、甚至
+   下一次输入才恢复全量；用户先删完再看，会觉得「删了没用」。
+3. **列表重建可能把光标打回开头**。搜索框是 ListView 的表头（`addHeaderView`），
+   `notifyDataSetChanged()` 会重新布局表头，选区有可能被重置到 0；光标在开头时
+   按退格什么也删不掉 —— 这是「删字不正常」最典型的一种。
+4. **换关键词后列表不回顶部**。删掉关键词时列表仍停在原来的滚动位置，看到的还是
+   一小段内容，主观上就是「没恢复全量」。
+5. 顺带：只改了首尾空格也会整库重排一遍（1.6 万条），连按退格时会掉字、发涩。
+
+### 问题二：搜索框有文字时随机观看只在搜索结果里播
+`randomWatch()` 里把 `query` 算进了 `filtered`：
+
+```java
+boolean filtered = offlineOnly || !filterAuthor.isEmpty() || !query.isEmpty();
+List<Work> source = filtered ? displayed : allWorks;
+```
+
+搜索框只是「在列表里找某一条」，却把随机池缩成了那几个命中结果。随手搜过一次之后，
+随机观看就一直在那几条里打转，用户体感就是「随机坏了」。
+
+### 改动
+- 新增纯 Java 类 `SearchNav`（可单测）：
+  - `normalize()` 去首尾空格、null 当空串；
+  - `delayMs(text, waitMore)`：组合输入 120ms、普通输入 260ms、**删空 0（立刻）**；
+  - `waitForComposing(composing, waits)`：组合输入最多等 `MAX_COMPOSING_WAITS = 6` 次
+    （约 0.7 秒），输入法一直不提交也不会永远不筛；
+  - `needsRebuild(applied, next)`：关键词真变了才重建。
+- `HomeActivity`：
+  - `searchRunnable` 改成「组合输入先等 → 关键词去重 → 重建 → 回列表顶部」；
+  - `onTextChanged` 里删空直接 `applySearchNow()`（不再等防抖），普通输入按 `SearchNav` 排期；
+  - 新增 `searchComposing()`（`BaseInputConnection.getComposingSpanStart`）、`applySearchNow()`、
+    `syncSearchClear()`、`rebuildKeepingCursor()`（重建前后保存/恢复选区，文本变了就不动）；
+  - 搜索框加「一键清空」（`ic_close`，`focusable=false`，不抢输入框焦点），有字才显示；
+    `setInputType(TEXT | NO_SUGGESTIONS)` + `IME_ACTION_SEARCH`，避免输入法自动补全成别的词；
+  - `randomWatch()` 不再把 `query` 算进范围：作者筛选 / 只看已下载仍生效（用
+    `Library.filter(allWorks, author, "", "all", false)` 另建一份，不能用带关键词的 `displayed`），
+    有关键词时会提示「已在全库随机（搜索关键词只用来筛列表）」。
+
+### 验证
+- 新增「搜索框输入节奏」19 项：归一化（null / 空格）、普通输入 260ms、删空 0ms、
+  组合输入 120ms、组合等待上限、关键词去重（首尾空格不算改动、删空要重建、null 等价空串）。
+- 单元测试 **PASS 382 / FAIL 0**（原 363）。
+- `android\build.ps1 -Test` 全绿 → **v1.0.33（code 43）**，产物
+  `android/JingYing-Watch-v1.0.33.apk`。
+- 改动前 3 个文件备份在 `%TEMP%\jingying-watch-backup-20261112\search-20261112\`。
+
+### 待真机验证
+- 中文搜索：拼音上屏前列表不动，选词后才筛；删字时列表不再忽空忽有。
+- 删到空：列表**立刻**回到全量并回到顶部；右侧 × 可一键清空且键盘不收起。
+- 光标停在字中间时按退格，删的是光标前那个字（不会跳到开头）。
+- 搜索「露营」后点「随机观看」：提示「已在全库随机」，播放顺序里会出现不匹配关键词的作品。
+- 点作者 chip 后再随机：仍只在该作者的作品里挑（作者筛选没有被绕过）。

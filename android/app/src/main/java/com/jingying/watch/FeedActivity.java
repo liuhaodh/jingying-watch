@@ -290,14 +290,22 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
 
     @Override
     public void onCompleted(FeedPage page) {
-        if (System.currentTimeMillis() - pager.lastTouchAt() < 900L) {
+        if (pager == null) {
+            page.seekTo(0);
+            page.showEndedState();
+            return;
+        }
+        int action = PlayNav.afterEnded(prefs.autoNext(),
+                pager.position() + 1 < pager.size(),
+                System.currentTimeMillis() - pager.lastTouchAt());
+        if (action == PlayNav.IGNORE) {
             // 刚滑过/正在滑：不要因为上一条刚好播完再自动跳一条
             return;
         }
-        if (prefs.autoNext() && pager != null
-                && pager.position() + 1 < pager.size()) {
+        if (action == PlayNav.NEXT) {
             pager.nextPage(true);
         } else {
+            // 关了自动连播，或者已经是最后一条：停在结尾等用户重播
             page.seekTo(0);
             page.showEndedState();
         }
@@ -642,8 +650,11 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
         panel.addView(Ui.label(this, (time.isEmpty() ? "" : time + " · ") + kind
                 + (size.isEmpty() ? "" : " · " + size), 12, Ui.DIM));
 
-        if (work.captionText != null && !work.captionText.isEmpty()) {
-            TextView caption = Ui.label(this, work.captionText, 13, 0xFFE6E6EC);
+        // 用 captionLine() 而不是裸的 captionText：电脑版对没文案的作品会写
+        // 「抖音作品 <id>」占位，那种不该在详情里当文案显示
+        String captionBody = work.captionLine();
+        if (!captionBody.isEmpty()) {
+            TextView caption = Ui.label(this, captionBody, 13, 0xFFE6E6EC);
             caption.setMaxLines(6);
             caption.setEllipsize(TextUtils.TruncateAt.END);
             LinearLayout.LayoutParams captionParams = new LinearLayout.LayoutParams(
@@ -656,6 +667,39 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
 
         String path = work.rel;
         panel.addView(Ui.label(this, "片库路径：" + path, 11, Ui.FAINT));
+
+        // 已下载到本地：把离线目录和里面的作品文件一起列出来，方便找文件 / 拷走。
+        // meta.json 是下载完成标记（OfflineStore 成功后才原子写），下载中或下载失败
+        // 被清空的目录不会出现这一段，也不会指向一个空壳路径。
+        File localDir = app.offline.dirFor(work);
+        if (LocalFiles.isDownloaded(localDir)) {
+            TextView localTitle = Ui.label(this, "本地文件（已下载）· 点按复制目录",
+                    11, Ui.DIM);
+            LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            titleParams.topMargin = Ui.dp(this, 12);
+            panel.addView(localTitle, titleParams);
+
+            final String localPath = localDir.getAbsolutePath();
+            TextView pathView = Ui.label(this, localPath, 11, 0xFF7FD8B0);
+            pathView.setTextIsSelectable(true);
+            pathView.setOnClickListener(view -> {
+                ClipboardManager manager =
+                        (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                manager.setPrimaryClip(ClipData.newPlainText("本地目录", localPath));
+                Ui.toast(this, "本地目录已复制");
+            });
+            panel.addView(pathView);
+
+            String listing = LocalFiles.listing(localDir, 6);
+            if (!listing.isEmpty()) {
+                TextView fileList = Ui.label(this, listing, 11, Ui.FAINT);
+                LinearLayout.LayoutParams listParams = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                listParams.topMargin = Ui.dp(this, 4);
+                panel.addView(fileList, listParams);
+            }
+        }
 
         // 删除作品：危险操作，单独一行、红框，点了还要再确认一次
         // 回收站预览里不能删（否则会把回收站里的目录再搬一次）
@@ -675,39 +719,57 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
         }
 
         LinearLayout actions = new LinearLayout(this);
-        actions.setOrientation(LinearLayout.HORIZONTAL);
-        actions.setGravity(Gravity.END);
+        actions.setOrientation(LinearLayout.VERTICAL);
         LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        actionsParams.topMargin = Ui.dp(this, 16);
+        actionsParams.topMargin = Ui.dp(this, 12);
         panel.addView(actions, actionsParams);
 
+        // 「作品链接」：文案.txt 里那一行可能是整段分享口令，复制前先只抽 URL。
+        // 复制出来的链接和「抖音打开」用的是同一个值，避免按钮说的和剪贴板不一致。
+        final String workLink = DouyinLinks.workUrl(work.awemeId, work.isAlbum(), work.shareUrl);
+        final boolean hasWorkLink = !workLink.isEmpty() || !work.awemeId.isEmpty();
+
+        LinearLayout firstRow = actionRow();
+        actions.addView(firstRow);
         TextView only = pillButton("作者主页", 0xFF2A2A32);
         only.setOnClickListener(view -> {
             dialog.dismiss();
             openAuthorPage(page);
         });
-        actions.addView(only);
+        firstRow.addView(only);
 
-        if (work.shareUrl != null && !work.shareUrl.isEmpty()) {
+        if (hasWorkLink) {
+            TextView open = pillButton("抖音打开", 0xFF2A2A32);
+            open.setOnClickListener(view -> {
+                dialog.dismiss();
+                DouyinLauncher.openWork(this, work.awemeId, work.shareUrl, work.isAlbum());
+            });
+            firstRow.addView(open, leftMargin(this, 10));
+        }
+
+        LinearLayout secondRow = null;
+        if (hasWorkLink) {
+            secondRow = actionRow();
+            LinearLayout.LayoutParams secondParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            secondParams.topMargin = Ui.dp(this, 10);
+            actions.addView(secondRow, secondParams);
+
             TextView copy = pillButton("复制链接", 0xFF2A2A32);
             copy.setOnClickListener(view -> {
-                ClipboardManager manager = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                manager.setPrimaryClip(ClipData.newPlainText("作品链接", work.shareUrl));
-                Ui.toast(this, "链接已复制");
+                ClipboardManager manager =
+                        (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                manager.setPrimaryClip(ClipData.newPlainText("作品链接", workLink));
+                Ui.toast(this, "链接已复制，粘贴到抖音即可打开");
                 dialog.dismiss();
             });
-            LinearLayout.LayoutParams copyParams = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            copyParams.leftMargin = Ui.dp(this, 10);
-            actions.addView(copy, copyParams);
+            secondRow.addView(copy);
         }
         TextView close = pillButton("关闭", 0xFF2A2A32);
         close.setOnClickListener(view -> dialog.dismiss());
-        LinearLayout.LayoutParams closeParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        closeParams.leftMargin = Ui.dp(this, 10);
-        actions.addView(close, closeParams);
+        // 没有链接时只有两个按钮，和原来一样挤在一行
+        (secondRow == null ? firstRow : secondRow).addView(close, leftMargin(this, 10));
 
         // 底部留一点边距
         FrameLayout wrapper = new FrameLayout(this);
@@ -727,6 +789,21 @@ public final class FeedActivity extends android.app.Activity implements FeedPage
         view.setBackground(Ui.round(this, background, 20));
         view.setPadding(Ui.dp(this, 18), Ui.dp(this, 9), Ui.dp(this, 18), Ui.dp(this, 9));
         return view;
+    }
+
+    /** 详情弹层的按钮行：右对齐、自动换行到下一行（四个 pill 一行放不下）。 */
+    private LinearLayout actionRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.END);
+        return row;
+    }
+
+    private static LinearLayout.LayoutParams leftMargin(Context context, int dp) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.leftMargin = Ui.dp(context, dp);
+        return params;
     }
 
     @Override

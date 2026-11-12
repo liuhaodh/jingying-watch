@@ -45,7 +45,8 @@ $Out = Join-Path $Project "android\build\tests"
 $Pure = @(
     "Work.java", "RemoteFile.java", "Mime.java",
     "Util.java", "Library.java", "Shuffles.java", "DouyinLinks.java",
-    "TarReader.java", "TarWriter.java", "HttpLite.java", "AlbumNav.java"
+    "TarReader.java", "TarWriter.java", "HttpLite.java", "AlbumNav.java", "LocalFiles.java",
+    "TapNav.java", "PlayNav.java", "SpeedNav.java", "SearchNav.java"
 )
 
 $Files = @()

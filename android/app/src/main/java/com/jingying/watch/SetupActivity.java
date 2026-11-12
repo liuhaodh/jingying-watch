@@ -141,6 +141,40 @@ public final class SetupActivity extends Activity {
         statusText.setPadding(0, Ui.dp(this, 14), 0, 0);
         content.addView(statusText);
 
+        // 播放
+        View playDivider = new View(this);
+        playDivider.setBackgroundColor(Ui.LINE);
+        LinearLayout.LayoutParams playDividerParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 1);
+        playDividerParams.topMargin = Ui.dp(this, 24);
+        content.addView(playDivider, playDividerParams);
+
+        content.addView(Ui.text(this, "播放", 16, Ui.TEXT, true));
+
+        CheckBox autoNextBox = new CheckBox(this);
+        autoNextBox.setText("播放结束后自动连播下一个");
+        autoNextBox.setTextColor(Ui.TEXT);
+        autoNextBox.setTextSize(13);
+        autoNextBox.setButtonTintList(ColorStateList.valueOf(Ui.ACCENT));
+        // 先 setChecked 再挂监听：否则初始化时会回写一次、还可能弹 toast
+        autoNextBox.setChecked(prefs.autoNext());
+        autoNextBox.setOnCheckedChangeListener((buttonView, checked) -> {
+            prefs.setAutoNext(checked);
+            Ui.toast(this, checked ? "已开启自动连播" : "已关闭自动连播");
+        });
+        LinearLayout.LayoutParams autoNextParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        autoNextParams.topMargin = Ui.dp(this, 8);
+        content.addView(autoNextBox, autoNextParams);
+
+        TextView autoNextNote = Ui.label(this,
+                "关闭后视频播完停在当前作品并显示播放按钮，轻点重播；"
+                        + "上下滑动仍然可以自己翻到下一个。", 11, Ui.FAINT);
+        LinearLayout.LayoutParams autoNextNoteParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        autoNextNoteParams.topMargin = Ui.dp(this, 6);
+        content.addView(autoNextNote, autoNextNoteParams);
+
         // 存储
         View divider = new View(this);
         divider.setBackgroundColor(Ui.LINE);

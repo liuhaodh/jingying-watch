@@ -14,6 +14,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.text.SpannableString;
 import android.text.Spanned;
 import android.text.TextUtils;
@@ -62,8 +63,8 @@ public final class FeedPage extends FrameLayout {
     }
 
     private static final long ALBUM_INTERVAL = 3200L;
-    /** 长按倍速。 */
-    private static final float BOOST_SPEED = 2f;
+    /** 图集大图读失败后的重试次数（退避 400/800/1200ms）。 */
+    private static final int ALBUM_LOAD_RETRIES = 3;
     private static final java.util.regex.Pattern TOKEN_PATTERN =
             java.util.regex.Pattern.compile("[#@][\\p{L}\\p{N}_\\u4e00-\\u9fa5]+");
 
@@ -115,6 +116,45 @@ public final class FeedPage extends FrameLayout {
 
     private MediaPlayer player;
     private MediaPlayer musicPlayer;
+    /**
+     * 图集里「实况 / 动图」用的播放器：电脑版把动图存成 `动图_01.mp4`，
+     * 和 `图片_01.jpg` 配对。复用同一个 TextureView，画面出来后再把静态图淡出。
+     * 单独一个播放器（不复用 player）是为了不搅乱视频作品的 prepared / playing / 进度状态。
+     */
+    private MediaPlayer livePlayer;
+    private boolean livePrepared;
+    /** 动图首帧已经盖住静态图（此时 cover 是 GONE）。 */
+    private boolean liveShown;
+    private int liveWidth;
+    private int liveHeight;
+    private int liveRevealAttempts;
+    /**
+     * 首帧不一定有 MEDIA_INFO_VIDEO_RENDERING_START 回调（部分 ROM 就不发），
+     * 所以轮询播放位置：真的开始出画面了再把静态图淡出，避免揭开一层黑屏。
+     */
+    private final Runnable liveReveal = new Runnable() {
+        @Override
+        public void run() {
+            if (liveShown || livePlayer == null || pageDestroyed) {
+                return;
+            }
+            long position = -1L;
+            boolean running = false;
+            try {
+                position = livePlayer.getCurrentPosition();
+                running = livePlayer.isPlaying();
+            } catch (Exception ignored) {
+            }
+            if (position > 0 && running) {
+                showAlbumLiveFrame();
+                return;
+            }
+            if (liveRevealAttempts < 8) {
+                liveRevealAttempts++;
+                handler.postDelayed(this, 250L);
+            }
+        }
+    };
     /** 作品包里的成员解到本地后的路径（同一个作品复用，切走不删缓存）。 */
     private java.io.File archiveVideo;
     private java.io.File archiveMusic;
@@ -130,6 +170,11 @@ public final class FeedPage extends FrameLayout {
     private boolean musicPrepared;
     private boolean visualReady;
     private boolean albumPaused;
+    /**
+     * 用户已经手动切过图：这个作品从此交给手动浏览，不再自动轮播。
+     * 换作品重新 bind 时清掉，所以只影响「被手动接管的那一个作品」。
+     */
+    private boolean albumManual;
     private final Runnable visualFallback = () -> {
         visualReady = true;
         startMusicIfReady();
@@ -138,6 +183,8 @@ public final class FeedPage extends FrameLayout {
     private int index;
     private int role;
     private int albumIndex;
+    /** 每次切图 +1：旧的加载 / 重试回调靠它对不上号就丢弃，不会把上一张画回来。 */
+    private int albumLoadToken;
     private String counterSuffix = "";
     private boolean prepared;
     private boolean playing;
@@ -147,7 +194,8 @@ public final class FeedPage extends FrameLayout {
     private boolean settingUp;
     private boolean coverHidden;
     private boolean speedBoost;
-    private int speedFailures;
+    /** 倍速的重试策略（写法降级 + 退避 + 什么时候才叫不支持）。 */
+    private final SpeedNav speedNav = new SpeedNav();
     private boolean previewMode;
     private boolean hostResumed = true;
     private int videoWidth;
@@ -186,12 +234,23 @@ public final class FeedPage extends FrameLayout {
                 if (player != null) {
                     player.setSurface(surface);
                 }
+                if (livePlayer != null) {
+                    livePlayer.setSurface(surface);
+                }
+                if (player != null && speedBoost) {
+                    // 没有 Surface 时视频轨没有渲染器，设倍速必定失败，之前都是直接跳过；
+                    // Surface 一就绪立刻补上，别让长按白按
+                    speedNav.restart();
+                    applySpeed(SpeedNav.BOOST);
+                }
                 applyVideoTransform();
+                applyLiveTransform();
             }
 
             @Override
             public void onSurfaceTextureSizeChanged(SurfaceTexture st, int width, int height) {
                 applyVideoTransform();
+                applyLiveTransform();
             }
 
             @Override
@@ -199,6 +258,12 @@ public final class FeedPage extends FrameLayout {
                 if (player != null) {
                     try {
                         player.setSurface(null);
+                    } catch (Exception ignored) {
+                    }
+                }
+                if (livePlayer != null) {
+                    try {
+                        livePlayer.setSurface(null);
                     } catch (Exception ignored) {
                     }
                 }
@@ -548,6 +613,8 @@ public final class FeedPage extends FrameLayout {
         archiveMusicRetries = 0;
         musicLookupDone = false;
         handler.removeCallbacks(musicRetry);
+        // 换作品：上一轮图集轮播的待执行任务先撤掉，等 prepareAlbum 重新排
+        handler.removeCallbacks(albumTicker);
         this.index = index;
         counterSuffix = " / " + total;
         prepared = false;
@@ -556,15 +623,20 @@ public final class FeedPage extends FrameLayout {
         detailsRequested = false;
         playAttempts = 0;
         speedBoost = false;
-        speedFailures = 0;
+        speedNav.reset();
         musicPrepared = false;
         visualReady = false;
         albumPaused = false;
+        albumManual = false;
         handler.removeCallbacks(visualFallback);
         coverHidden = false;
         albumIndex = 0;
         videoWidth = 0;
         videoHeight = 0;
+        liveWidth = 0;
+        liveHeight = 0;
+        liveShown = false;
+        livePrepared = false;
         errorText.setVisibility(GONE);
         spinner.stop();
         spinner.setVisibility(GONE);
@@ -831,10 +903,11 @@ public final class FeedPage extends FrameLayout {
     }
 
     /** 文案不是可点击控件（避免吞掉上下滑手势），由 pager 在单击时按坐标命中 #话题 / @用户。 */
-    public boolean handleCaptionTap(float x, float y) {
+    /** 命中的话题序号；没有返回 -1。只做判定、无副作用，手势层也能安全调用。 */
+    private int captionTokenAt(float x, float y) {
         if (captionText == null || captionText.getVisibility() != VISIBLE
                 || captionText.getLayout() == null || captionRanges.isEmpty()) {
-            return false;
+            return -1;
         }
         int[] pageLocation = new int[2];
         int[] captionLocation = new int[2];
@@ -844,23 +917,36 @@ public final class FeedPage extends FrameLayout {
         float localY = pageLocation[1] + y - captionLocation[1] - captionText.getPaddingTop();
         if (localX < 0 || localY < 0 || localX > captionText.getWidth()
                 || localY > captionText.getHeight()) {
-            return false;
+            return -1;
         }
         int line = captionText.getLayout().getLineForVertical((int) localY);
         if (line < 0 || line >= captionText.getLineCount()) {
-            return false;
+            return -1;
         }
         int offset = captionText.getLayout().getOffsetForHorizontal(line, localX);
         for (int index = 0; index < captionRanges.size(); index++) {
             int[] range = captionRanges.get(index);
             if (offset >= range[0] - 1 && offset <= range[1]) {
-                if (listener != null) {
-                    listener.onToken(this, captionTokens.get(index));
-                }
-                return true;
+                return index;
             }
         }
-        return false;
+        return -1;
+    }
+
+    /** 双击判定用：这个位置是不是落在可点的话题文字上（不触发跳转）。 */
+    public boolean hasCaptionTokenAt(float x, float y) {
+        return captionTokenAt(x, y) >= 0;
+    }
+
+    public boolean handleCaptionTap(float x, float y) {
+        int index = captionTokenAt(x, y);
+        if (index < 0) {
+            return false;
+        }
+        if (listener != null) {
+            listener.onToken(this, captionTokens.get(index));
+        }
+        return true;
     }
 
     private void requestDetailsIfNeeded() {
@@ -964,9 +1050,11 @@ public final class FeedPage extends FrameLayout {
                 videoHeight = mediaPlayer.getVideoHeight();
                 applyVideoTransform();
                 if (role == 0 && !userPaused && hostResumed) {
-                    // 先设倍速再 start：部分机型只有在 Prepared 状态设置才真正生效
+                    // 先设倍速再 start：部分机型只有在 Prepared 状态设置才真正生效。
+                    // 新播放器 = 新引擎，把上一次的失败计数清掉重新给机会
                     if (speedBoost) {
-                        applySpeed(BOOST_SPEED);
+                        speedNav.restart();
+                        applySpeed(SpeedNav.BOOST);
                     }
                     mediaPlayer.start();
                     playing = true;
@@ -983,6 +1071,11 @@ public final class FeedPage extends FrameLayout {
                 if (what == MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START
                         || what == MediaPlayer.MEDIA_INFO_BUFFERING_END) {
                     hideCover();
+                    if (speedBoost) {
+                        // 缓冲期间设倍速很容易被拒，这会儿才算「状态变了」，清掉失败计数再补一次
+                        speedNav.restart();
+                        applySpeed(SpeedNav.BOOST);
+                    }
                 }
                 return false;
             });
@@ -1030,8 +1123,10 @@ public final class FeedPage extends FrameLayout {
                 mp.setSurface(surface);
             }
             mp.prepareAsync();
-            if (localVideo == null && app.prefs.autoNext() && !work.video.inArchive()) {
-                // 预取下一屏的数据，滑过去就能直接播（作品包按成员解，不需要代理预取）
+            if (localVideo == null && !work.video.inArchive()) {
+                // 边播边把这段视频补完，回滑 / 重播都不必重新拉（作品包按成员解，不需要代理预取）。
+                // 只和「这段视频有没有本地文件」有关，与自动连播开关无关：
+                // 关掉连播不代表当前这集不需要缓存。
                 app.proxy.prefetch(work.video.rel, work.video.name, work.video.size);
             }
         } catch (Exception exc) {
@@ -1057,7 +1152,9 @@ public final class FeedPage extends FrameLayout {
         prepared = true;
         cover.setScaleType(ImageView.ScaleType.FIT_CENTER);
         cover.setBackgroundColor(Color.BLACK);
-        showAlbumImage(0, false);
+        // 用当前索引而不是写死 0：换作品时 bind() 已经把它清成 0；但「上次释放过播放器
+        // 又滑回来」会重新 prepare，这时写死 0 会把用户刚切到的第 N 张打回第 1 张
+        showAlbumImage(albumIndex, false);
         scheduleAlbumTicker();
         // 图集首图读不出来（解包失败 / 网络抖动 / 解码失败）时，visualReady 永远不会置位，
         // 已经 prepare 好的背景音乐就被一起卡死。随机观看的作品全是冷数据，
@@ -1205,11 +1302,44 @@ public final class FeedPage extends FrameLayout {
             index = 0;
         }
         albumIndex = index;
-        RemoteFile file = work.images.get(index);
-        final int target = index;
-        final Work boundWork = work;
-        ImageLoader.Callback albumCallback = (key, bitmap) -> {
-            if (bitmap == null || work == null || work != boundWork || albumIndex != target) {
+        final int token = ++albumLoadToken;
+        // 新的一张没有配对的动图时，先把上一张的动图收掉：否则它会继续在同一块
+        // TextureView 上循环，静态图却还是上一张，看起来就像「切了没反应」。
+        if (work.liveFor(index) == null) {
+            stopAlbumLive();
+        }
+        loadAlbumImage(work, index, animate, token, 0);
+        albumBadge.setVisibility(work.isAlbum() ? VISIBLE : GONE);
+        albumBadge.setText("图集 " + (index + 1) + "/" + work.images.size());
+        progressLine.setProgress((index + 1f) / work.images.size());
+        updateProgressTime();
+        prefetchAlbumNeighbors(index);
+    }
+
+    /**
+     * 加载第 index 张图，失败就退避重试。
+     *
+     * <p>以前加载失败时回调直接 return：画面停在上一次（通常就是第 1 张），角标却
+     * 已经跳到「图集 2/3」，既不提示也不会自己恢复。用户看到的就是「划了一下，
+     * 还是第一张」。WebDAV 偶发超时 / 一次性链接失效都算这一类。
+     */
+    private void loadAlbumImage(final Work boundWork, final int index, final boolean animate,
+                                final int token, final int attempt) {
+        if (work != boundWork || token != albumLoadToken) {
+            return;
+        }
+        final ImageLoader.Callback albumCallback = (key, bitmap) -> {
+            if (work != boundWork || token != albumLoadToken) {
+                return;
+            }
+            if (bitmap == null) {
+                if (attempt < ALBUM_LOAD_RETRIES) {
+                    handler.postDelayed(() -> loadAlbumImage(boundWork, index, animate,
+                            token, attempt + 1), 400L * (attempt + 1));
+                } else if (role == 0) {
+                    // 真读不出来就说一句，别让人以为横滑根本没生效
+                    Ui.toast(getContext(), "这一张图读取失败，已自动重试");
+                }
                 return;
             }
             cover.setImageBitmap(bitmap);
@@ -1224,18 +1354,16 @@ public final class FeedPage extends FrameLayout {
             visualReady = true;
             handler.removeCallbacks(visualFallback);
             startMusicIfReady();
+            // 静态图先顶上，再让这一张的实况动图叠上来；没有动图就保持静态图
+            prepareAlbumLive(index);
         };
-        java.io.File localImage = app.offline.localImage(work, index);
+        java.io.File localImage = app.offline.localImage(boundWork, index);
         if (localImage != null) {
             images.loadLocalImage(localImage, Ui.screenWidth(getContext()), albumCallback);
         } else {
-            images.loadImage(file, Ui.screenWidth(getContext()), albumCallback);
+            images.loadImage(boundWork.images.get(index), Ui.screenWidth(getContext()),
+                    albumCallback);
         }
-        albumBadge.setVisibility(work.isAlbum() ? VISIBLE : GONE);
-        albumBadge.setText("图集 " + (index + 1) + "/" + work.images.size());
-        progressLine.setProgress((index + 1f) / work.images.size());
-        updateProgressTime();
-        prefetchAlbumNeighbors(index);
     }
 
     /**
@@ -1254,10 +1382,260 @@ public final class FeedPage extends FrameLayout {
         }
     }
 
+    // ---------- 图集里的实况 / 动图 ----------
+
+    /**
+     * 这一张有没有配对的动图：有就开始播，没有就把播放器收掉、露出静态图。
+     *
+     * 电脑版导出图集时，每张图可能带一段短视频（`动图_01.mp4` ↔ `图片_01.jpg`），
+     * 以前 App 只读 `images`、把 lives 整个忽略，所以实况图永远只有一张静态照片。
+     */
+    private void prepareAlbumLive(int index) {
+        if (work == null || !work.hasLives() || work.liveFor(index) == null) {
+            stopAlbumLive();
+            return;
+        }
+        // 换到新的一张：先把静态图露出来，等动图首帧到了再淡出，避免中间黑一下
+        liveShown = false;
+        handler.removeCallbacks(liveReveal);
+        cover.animate().cancel();
+        cover.setAlpha(1f);
+        cover.setScaleX(1f);
+        cover.setScaleY(1f);
+        if (cover.getVisibility() != VISIBLE) {
+            cover.setVisibility(VISIBLE);
+        }
+        playAlbumLive(index);
+    }
+
+    private void playAlbumLive(int index) {
+        if (pageDestroyed || work == null) {
+            return;
+        }
+        final Work bound = work;
+        final int target = index;
+        RemoteFile live = work.liveFor(index);
+        if (live == null) {
+            stopAlbumLive();
+            return;
+        }
+        if (live.inArchive()) {
+            // ArchiveStore 自己按目标文件加锁并缓存，切来切去重复调用也不会重复解包
+            app.archives.file(live, (file, error) -> {
+                if (pageDestroyed || work != bound || albumIndex != target) {
+                    return;
+                }
+                if (file == null) {
+                    // 解包失败就停在静态图，不影响看图
+                    android.util.Log.w("JYWatch", "动图解包失败 " + live.name
+                            + (error == null ? "" : "：" + error));
+                    return;
+                }
+                startAlbumLive(file, target);
+            });
+            return;
+        }
+        startAlbumLive(app.offline.localLive(bound, index), target);
+    }
+
+    private void startAlbumLive(java.io.File local, int index) {
+        if (pageDestroyed || work == null) {
+            return;
+        }
+        RemoteFile live = work.liveFor(index);
+        if (live == null) {
+            return;
+        }
+        releaseAlbumLive();
+        try {
+            java.io.File localFile = local;
+            String url = localFile != null ? null
+                    : app.proxy.urlFor(live.rel, live.name, live.size);
+            MediaPlayer mp = new MediaPlayer();
+            // 先挂字段：setDataSource / prepareAsync 抛异常时 catch 才释放得到
+            livePlayer = mp;
+            mp.setAudioStreamType(AudioManager.STREAM_MUSIC);
+            // 循环播放：3.2 秒的自动轮播可能比动图本身短，不循环就会切到一半停住
+            mp.setLooping(true);
+            // 动图静音：背景音乐在 musicPlayer 上，两条一起响会糊成一片
+            mp.setVolume(0f, 0f);
+            mp.setOnPreparedListener(player -> {
+                if (player != livePlayer) {
+                    return;
+                }
+                livePrepared = true;
+                applyLiveTransform();
+                if (albumLiveShouldPlay()) {
+                    try {
+                        player.start();
+                    } catch (Exception ignored) {
+                    }
+                }
+                // 有的机型不回调 MEDIA_INFO_VIDEO_RENDERING_START，轮询兜底
+                liveRevealAttempts = 0;
+                handler.removeCallbacks(liveReveal);
+                handler.postDelayed(liveReveal, 250L);
+            });
+            mp.setOnVideoSizeChangedListener((player, width, height) -> {
+                liveWidth = width;
+                liveHeight = height;
+                applyLiveTransform();
+            });
+            mp.setOnInfoListener((player, what, extra) -> {
+                if (what == MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
+                    showAlbumLiveFrame();
+                }
+                return false;
+            });
+            mp.setOnErrorListener((player, what, extra) -> {
+                android.util.Log.w("JYWatch", "动图播放失败 " + live.name
+                        + " what=" + what + " extra=" + extra);
+                releaseAlbumLive();
+                return true;
+            });
+            if (localFile != null) {
+                mp.setDataSource(localFile.getAbsolutePath());
+            } else {
+                mp.setDataSource(getContext(), Uri.parse(url));
+            }
+            if (surface != null) {
+                mp.setSurface(surface);
+            }
+            mp.prepareAsync();
+            if (localFile == null && !live.inArchive()) {
+                app.proxy.prefetch(live.rel, live.name, live.size);
+            }
+        } catch (Exception exc) {
+            android.util.Log.w("JYWatch", "动图准备失败 " + live.name, exc);
+            releaseAlbumLive();
+        }
+    }
+
+    /** 动图首帧已上屏：把静态图淡出，让 TextureView 的画面露出来。 */
+    private void showAlbumLiveFrame() {
+        if (liveShown || livePlayer == null || pageDestroyed) {
+            return;
+        }
+        liveShown = true;
+        handler.removeCallbacks(liveReveal);
+        cover.animate().cancel();
+        cover.animate().alpha(0f).setDuration(160).withEndAction(() -> {
+            if (liveShown) {
+                cover.setVisibility(GONE);
+                // 切图时那个 1.015 倍「呼吸」动画可能被取消在半路，
+                // 这里还原，下次静态图重新出现时不会莫名其妙变大
+                cover.setScaleX(1f);
+                cover.setScaleY(1f);
+            }
+        }).start();
+        visualReady = true;
+        handler.removeCallbacks(visualFallback);
+        startMusicIfReady();
+    }
+
+    /** 收起动图、把静态图放回来（这一张没有动图 / 播放失败 / 换作品）。 */
+    private void stopAlbumLive() {
+        // 本来就没有动图时什么都别做：这里的 cancel / setAlpha 会打断
+        // showAlbumImage 正在跑的 1.015 倍缩放动画，把图卡在放大状态
+        boolean hadLive = liveShown || livePlayer != null;
+        releaseAlbumLive();
+        liveShown = false;
+        handler.removeCallbacks(liveReveal);
+        if (!hadLive) {
+            return;
+        }
+        cover.animate().cancel();
+        cover.setAlpha(1f);
+        cover.setScaleX(1f);
+        cover.setScaleY(1f);
+        if (cover.getVisibility() != VISIBLE) {
+            cover.setVisibility(VISIBLE);
+        }
+    }
+
+    private void releaseAlbumLive() {
+        livePrepared = false;
+        handler.removeCallbacks(liveReveal);
+        if (livePlayer != null) {
+            try {
+                livePlayer.stop();
+            } catch (Exception ignored) {
+            }
+            try {
+                livePlayer.release();
+            } catch (Exception ignored) {
+            }
+            livePlayer = null;
+        }
+    }
+
+    private boolean albumLiveShouldPlay() {
+        return role == 0 && hostResumed && !albumPaused && !userPaused;
+    }
+
+    public void pauseAlbumLive() {
+        if (livePlayer == null) {
+            return;
+        }
+        try {
+            if (livePlayer.isPlaying()) {
+                livePlayer.pause();
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    public void resumeAlbumLive() {
+        if (livePlayer == null || !livePrepared || !albumLiveShouldPlay()) {
+            return;
+        }
+        try {
+            livePlayer.start();
+        } catch (Exception ignored) {
+        }
+        if (!liveShown) {
+            // 预加载屏（role != 0）里 prepare 但不 start，轮询早就放弃了；
+            // 真正滑到这一屏时要重新盯着，别让静态图一直盖着动图
+            liveRevealAttempts = 0;
+            handler.removeCallbacks(liveReveal);
+            handler.postDelayed(liveReveal, 250L);
+        }
+    }
+
+    /**
+     * 动图的画面变换：图集静态图是 FIT_CENTER（完整显示），动图也必须完整显示，
+     * 不然切换瞬间会从「不裁切」跳到「铺满裁切」。所以这里固定 contain。
+     */
+    private void applyLiveTransform() {
+        if (liveWidth <= 0 || liveHeight <= 0 || texture == null
+                || texture.getWidth() <= 0 || texture.getHeight() <= 0) {
+            return;
+        }
+        float viewWidth = texture.getWidth();
+        float viewHeight = texture.getHeight();
+        float liveAspect = liveWidth / (float) liveHeight;
+        float screenAspect = viewWidth / viewHeight;
+        float scaleX = 1f;
+        float scaleY = 1f;
+        if (liveAspect >= screenAspect) {
+            scaleY = screenAspect / liveAspect;
+        } else {
+            scaleX = liveAspect / screenAspect;
+        }
+        Matrix matrix = new Matrix();
+        matrix.setScale(scaleX, scaleY, viewWidth / 2f, viewHeight / 2f);
+        texture.setTransform(matrix);
+    }
+
+    /** 这个作品还要不要自动轮播。判定统一放 AlbumNav，别让两处条件各写一套。 */
+    private boolean albumShouldAdvance() {
+        int count = work != null && work.isAlbum() ? work.images.size() : 0;
+        return AlbumNav.shouldAutoAdvance(albumManual, albumPaused, count, role == 0, hostResumed);
+    }
+
     private void scheduleAlbumTicker() {
         handler.removeCallbacks(albumTicker);
-        if (work == null || !work.isAlbum() || albumPaused
-                || work.images.size() <= 1 || role != 0 || !hostResumed) {
+        if (!albumShouldAdvance()) {
             return;
         }
         handler.postDelayed(albumTicker, ALBUM_INTERVAL);
@@ -1266,8 +1644,7 @@ public final class FeedPage extends FrameLayout {
     private final Runnable albumTicker = new Runnable() {
         @Override
         public void run() {
-            if (work == null || !work.isAlbum() || albumPaused
-                    || role != 0 || !hostResumed) {
+            if (!albumShouldAdvance()) {
                 return;
             }
             showAlbumImage(AlbumNav.wrap(albumIndex + 1, work.images.size()), true);
@@ -1275,14 +1652,27 @@ public final class FeedPage extends FrameLayout {
         }
     };
 
+    /**
+     * 用户手动切过一张：这个作品从此不自动轮播。
+     *
+     * 以前手动切完 3.2 秒定时器照旧把画面带走，等于白划一次；现在第一次手动切
+     * 就撤掉定时器，本作品内不再自动切（换作品 bind 时重置）。
+     */
+    private void markAlbumManual() {
+        albumManual = true;
+        handler.removeCallbacks(albumTicker);
+    }
+
     public void advanceAlbum() {
         if (work != null && work.isAlbum() && !work.images.isEmpty()) {
+            markAlbumManual();
             showAlbumImage(AlbumNav.wrap(albumIndex + 1, work.images.size()), true);
         }
     }
 
     public void previousAlbum() {
         if (work != null && work.isAlbum() && !work.images.isEmpty()) {
+            markAlbumManual();
             showAlbumImage(AlbumNav.wrap(albumIndex - 1, work.images.size()), true);
         }
     }
@@ -1295,6 +1685,7 @@ public final class FeedPage extends FrameLayout {
         albumPaused = true;
         userPaused = true;
         handler.removeCallbacks(albumTicker);
+        pauseAlbumLive();
         if (musicPlayer != null) {
             try {
                 musicPlayer.pause();
@@ -1310,6 +1701,7 @@ public final class FeedPage extends FrameLayout {
         }
         albumPaused = false;
         userPaused = false;
+        resumeAlbumLive();
         startMusicIfReady();
         scheduleAlbumTicker();
         updatePlayGlyph();
@@ -1409,6 +1801,7 @@ public final class FeedPage extends FrameLayout {
             if (work != null && work.isAlbum()) {
                 scheduleAlbumTicker();
                 if (!albumPaused) {
+                    resumeAlbumLive();
                     startMusicIfReady();
                 }
             } else if (prepared && !userPaused && hostResumed) {
@@ -1422,6 +1815,7 @@ public final class FeedPage extends FrameLayout {
             }
         } else {
             pauseInternal();
+            pauseAlbumLive();
             handler.removeCallbacks(albumTicker);
             if (musicPlayer != null) {
                 try {
@@ -1447,7 +1841,7 @@ public final class FeedPage extends FrameLayout {
             userPaused = false;
             playGlyph.setVisibility(GONE);
             if (speedBoost) {
-                applySpeed(2f);
+                applySpeed(SpeedNav.BOOST);
             }
         } catch (Exception ignored) {
         }
@@ -1462,6 +1856,8 @@ public final class FeedPage extends FrameLayout {
             }
             playing = false;
         }
+        // 图集页没有 player，停的是动图播放器
+        pauseAlbumLive();
         if (musicPlayer != null) {
             try {
                 musicPlayer.pause();
@@ -1536,6 +1932,7 @@ public final class FeedPage extends FrameLayout {
     public void resume() {
         if (role == 0 && hostResumed) {
             if (work != null && work.isAlbum()) {
+                resumeAlbumLive();
                 startMusicIfReady();
                 scheduleAlbumTicker();
             } else if (prepared && !userPaused) {
@@ -1580,50 +1977,113 @@ public final class FeedPage extends FrameLayout {
 
     public void setSpeedBoost(boolean boost) {
         speedBoost = boost;
-        if (boost) {
-            speedFailures = 0;
-        }
-        applySpeed(boost ? BOOST_SPEED : 1f);
+        // 每次长按都从头试：上一次长按留下的「不支持」结论不能带到这一次
+        speedNav.reset();
+        applySpeed(boost ? SpeedNav.BOOST : 1f);
     }
 
     /**
      * 设置播放倍速。
      *
-     * 几个坑：
-     * - 必须在 start() 之后设置，Prepared 状态下设置会被当成「开始播放」；
-     * - 缓冲、seek、切后台回来都可能把倍速打回 1×，所以要配合 {@link #keepSpeed()} 补；
-     * - 别复用 getPlaybackParams() 返回的对象，新建一个更稳（避免继承到设备不认的 fallback 模式）。
+     * <p>几个坑：</p>
+     * <ul>
+     *   <li>必须在 start() 之后设置，Prepared 状态下设置会被当成「开始播放」；</li>
+     *   <li>缓冲、seek、切后台回来都可能把倍速打回 1×，所以要配合 {@link #keepSpeed()} 补；</li>
+     *   <li>别复用 getPlaybackParams() 返回的对象，新建一个更稳（避免继承到设备不认的 fallback 模式），
+     *       但「沿用当前参数只改速度」可以作为最后一种兜底写法；</li>
+     *   <li>抛异常 ≠ 这台机器不支持：没 Surface、正在 prepare / 缓冲、视频没音轨、pitch 不被接受
+     *       都会抛。所以失败要交给 {@link SpeedNav} 换写法重试，试到上限才下结论。</li>
+     * </ul>
      */
     private void applySpeed(float speed) {
+        if (speed <= 1.001f) {
+            restoreSpeed();
+            return;
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            speedNav.giveUp();
+            refreshSpeedLabel();
+            return;
+        }
+        if (player == null || !prepared) {
+            // 还没准备好：speedBoost 已经记下，onPrepared 里会补设。
+            // 这里不能算失败，否则「还没准备好」会被误报成「不支持倍速」。
+            return;
+        }
+        if (surface == null) {
+            // 视频轨没有渲染器时设置倍速必定抛 INVALID_OPERATION（不是不支持），
+            // 等 Surface 就绪会重新补；这种失败一次都不该记
+            return;
+        }
+        long now = SystemClock.uptimeMillis();
+        if (!speedNav.shouldAttempt(now)) {
+            return;
+        }
+        speedNav.markAttempt(now);
+        int variant = speedNav.variant();
+        try {
+            player.setPlaybackParams(buildSpeedParams(variant));
+            speedNav.onSuccess();
+            android.util.Log.i("JYWatch", "倍速已设置为 " + speed + "×（写法 " + variant + "）");
+        } catch (Exception exc) {
+            speedNav.onFailure();
+            android.util.Log.w("JYWatch", "setPlaybackParams 失败（写法 " + variant + "，第 "
+                    + speedNav.failures() + " 次）：" + exc
+                    + " playing=" + playing + " prepared=" + prepared + " surface=" + (surface != null));
+        }
+        refreshSpeedLabel();
+    }
+
+    /**
+     * 三种写法依次降级：
+     * 0 带 pitch（最常见也最容易被拒）/ 1 只给 speed / 2 沿用播放器当前参数只改速度。
+     */
+    private PlaybackParams buildSpeedParams(int variant) {
+        if (variant >= 2) {
+            try {
+                PlaybackParams current = player.getPlaybackParams();
+                if (current != null) {
+                    return current.setSpeed(SpeedNav.BOOST);
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (variant == 1) {
+            return new PlaybackParams().setSpeed(SpeedNav.BOOST);
+        }
+        return new PlaybackParams().setSpeed(SpeedNav.BOOST).setPitch(1f);
+    }
+
+    /** 松手恢复 1×。恢复失败无所谓，也不该影响「支持 / 不支持」的判定。 */
+    private void restoreSpeed() {
         if (player == null || !prepared || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
             return;
         }
         try {
-            PlaybackParams params = new PlaybackParams()
-                    .setSpeed(speed)
-                    .setPitch(1f);
-            player.setPlaybackParams(params);
-            speedFailures = 0;
-            android.util.Log.i("JYWatch", "倍速已设置为 " + speed + "×");
-        } catch (Exception exc) {
-            speedFailures++;
-            android.util.Log.w("JYWatch", "setPlaybackParams(" + speed + ") 失败："
-                    + exc + " playing=" + playing + " prepared=" + prepared);
+            player.setPlaybackParams(new PlaybackParams().setSpeed(1f).setPitch(1f));
+            return;
+        } catch (Exception ignored) {
+        }
+        try {
+            player.setPlaybackParams(new PlaybackParams().setSpeed(1f));
+        } catch (Exception ignored) {
         }
     }
 
-    /** 正在 2× 时，每帧检查一下倍速有没有被打回 1×，被打回就补上。 */
+    /** 正在 2× 时，每次进度刷新检查一下倍速有没有被打回 1×，被打回就补上。 */
     private void keepSpeed() {
-        if (!speedBoost || speedFailures > 3 || Build.VERSION.SDK_INT < Build.VERSION_CODES.M
-                || player == null || !prepared) {
+        if (!speedBoost || speedNav.unsupported()
+                || Build.VERSION.SDK_INT < Build.VERSION_CODES.M
+                || player == null || !prepared || surface == null) {
             return;
         }
         try {
-            if (Math.abs(player.getPlaybackParams().getSpeed() - BOOST_SPEED) > 0.01f) {
-                applySpeed(BOOST_SPEED);
+            if (Math.abs(player.getPlaybackParams().getSpeed() - SpeedNav.BOOST) < 0.01f) {
+                return;
             }
         } catch (Exception ignored) {
         }
+        applySpeed(SpeedNav.BOOST);
     }
 
     // ---------- 进度 ----------
@@ -1820,6 +2280,8 @@ public final class FeedPage extends FrameLayout {
     public void releasePlayers() {
         handler.removeCallbacks(albumTicker);
         handler.removeCallbacks(musicRetry);
+        releaseAlbumLive();
+        liveShown = false;
         if (player != null) {
             try {
                 player.stop();
@@ -1841,7 +2303,7 @@ public final class FeedPage extends FrameLayout {
         visualReady = false;
         albumPaused = false;
         speedBoost = false;
-        speedFailures = 0;
+        speedNav.reset();
         handler.removeCallbacks(albumTicker);
         handler.removeCallbacks(visualFallback);
     }
@@ -1873,9 +2335,22 @@ public final class FeedPage extends FrameLayout {
     }
 
     public void setSpeedLabel(boolean show) {
-        // 设置倍速抛异常时别再显示「2× 播放中」骗人，直接说明不支持
-        timePill.setText(show && speedFailures > 0 ? "倍速不可用" : "2× 播放中");
-        timePill.setVisibility(show ? VISIBLE : GONE);
+        if (!show) {
+            timePill.setVisibility(GONE);
+            return;
+        }
+        timePill.setVisibility(VISIBLE);
+        // 文案按真实状态算：以前只在按下的那一瞬间写一次死文本，第一次设置失败就
+        // 一直显示「倍速不可用」，哪怕 300ms 后重试其实成功了。
+        refreshSpeedLabel();
+    }
+
+    /** 倍速提示只反映真实状态：还在重试 / 已生效都写「2× 播放中」，真试到上限才说不支持。 */
+    private void refreshSpeedLabel() {
+        if (timePill == null || timePill.getVisibility() != VISIBLE) {
+            return;
+        }
+        timePill.setText(speedNav.label());
     }
 
     /** 播放到最后一个作品时停在当前屏，露出播放按钮，方便重看。 */

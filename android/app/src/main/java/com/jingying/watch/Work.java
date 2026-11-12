@@ -208,6 +208,38 @@ public final class Work {
         return true;
     }
 
+    /** 这个图集里有没有实况 / 动图视频（电脑版存成 `动图_01.mp4`）。 */
+    public boolean hasLives() {
+        return !lives.isEmpty();
+    }
+
+    /**
+     * 第 index 张图配对的动图视频。
+     *
+     * 电脑版按序号命名：`图片_01.jpg` ↔ `动图_01.mp4`，序号相同才是一对，
+     * 不能按列表下标硬对（有的包里动图会缺几张）。序号取文件名里第一段数字，
+     * 和 images / lives 的排序用的是同一套规则。
+     *
+     * 旧包个别没有数字时退化成「数量一致就按下标配」，数量对不上就当没有动图。
+     */
+    public RemoteFile liveFor(int index) {
+        if (lives.isEmpty() || index < 0 || index >= images.size()) {
+            return null;
+        }
+        int wanted = indexOf(images.get(index).name);
+        if (wanted < 1000000) {
+            for (RemoteFile live : lives) {
+                if (indexOf(live.name) == wanted) {
+                    return live;
+                }
+            }
+        }
+        if (lives.size() == images.size()) {
+            return lives.get(index);
+        }
+        return null;
+    }
+
     /** 用详情结果原地更新（列表里持有同一个对象）。 */
     public boolean mergeDetails(Work other) {
         if (other == null) {
@@ -330,30 +362,85 @@ public final class Work {
         return archive != null;
     }
 
+    /** 电脑版给「没有文案的作品」写的占位前缀（models.display_title 的兜底）。 */
+    private static final String[] ID_PLACEHOLDERS = {
+            "抖音作品id", "抖音作品ID", "抖音作品", "作品id", "作品ID", "作品编号",
+            "aweme_id", "awemeid",
+    };
+    /** 只允许出现在占位文本首尾的装饰字符；中间的（比如 `_20260101`）一律不算。 */
+    private static final String ID_DECORATIONS = " \t:：-_#.、";
+
     /**
-     * 电脑版把作品打包成 `<作品id>.tar`，扫进来的 title / folderTitle 就是这串数字。
-     * 它是文件名，不是用户可读的文案或标题，别拿来当作品名显示。
+     * 这串文本是不是「机器生成的作品标识」，而不是用户能读的文案/标题。命中两种情况：
+     * <ul>
+     *   <li>电脑版把作品打包成 `<作品id>.tar`，扫进来的 title / folderTitle 就是这串数字；</li>
+     *   <li>作品没有文案时，电脑版把 `抖音作品 <作品id>` 写进了 文案.txt
+     *       （downloader 用 models.display_title() 兜底），于是 captionText 里也是一串 ID。</li>
+     * </ul>
+     * 顺带容忍 `作品ID：7525…`、`抖音作品 7525…` 这些前缀和首尾冒号/连字符。
      */
     public static boolean looksLikeWorkId(String text) {
         if (text == null) {
             return false;
         }
-        String value = text.trim();
-        if (value.length() < 6 || value.length() > 32) {
+        String value = text.replace("\r", "").trim();
+        if (value.isEmpty()) {
             return false;
         }
-        for (int index = 0; index < value.length(); index++) {
+        if (value.indexOf('\n') >= 0) {
+            // 只有「第一行是 ID、后面全是空行」这种包装才算占位；多行真文案一律放过
+            String[] lines = value.split("\n", -1);
+            for (int index = 1; index < lines.length; index++) {
+                if (!lines[index].trim().isEmpty()) {
+                    return false;
+                }
+            }
+            value = lines[0].trim();
+        }
+        boolean prefixed = false;
+        boolean stripped = true;
+        while (stripped) {
+            stripped = false;
+            for (String prefix : ID_PLACEHOLDERS) {
+                if (value.length() >= prefix.length()
+                        && value.regionMatches(true, 0, prefix, 0, prefix.length())) {
+                    value = value.substring(prefix.length()).trim();
+                    prefixed = true;
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        int start = 0;
+        int end = value.length();
+        while (start < end && ID_DECORATIONS.indexOf(value.charAt(start)) >= 0) {
+            start++;
+        }
+        while (end > start && ID_DECORATIONS.indexOf(value.charAt(end - 1)) >= 0) {
+            end--;
+        }
+        int digits = 0;
+        for (int index = start; index < end; index++) {
             char c = value.charAt(index);
             if (c < '0' || c > '9') {
                 return false;
             }
+            digits++;
         }
-        return true;
+        if (digits == 0) {
+            return false;
+        }
+        // 带「抖音作品 / 作品ID」前缀的，哪怕位数短一点也是占位；纯数字则要像个作品 ID
+        return prefixed ? digits <= 32 : digits >= 6 && digits <= 32;
     }
 
-    /** 有没有真正的文案；目录名 / tar 名不算文案。 */
+    /** 有没有真正的文案；目录名 / tar 名 / 「抖音作品 <id>」占位都不算文案。 */
     public boolean hasCaption() {
-        return captionText != null && !captionText.trim().isEmpty();
+        if (captionText == null) {
+            return false;
+        }
+        String value = captionText.trim();
+        return !value.isEmpty() && !looksLikeWorkId(value);
     }
 
     /** 纯数字作品 ID 不是可读标题，返回空串让调用方继续回退。 */
@@ -682,8 +769,14 @@ public final class Work {
         }
         String caption = captionLines.toString().trim();
         if (!caption.isEmpty()) {
-            work.captionText = caption;
-            work.title = firstLine(caption);
+            if (looksLikeWorkId(caption)) {
+                // 电脑版对「本来就没有文案」的作品会写 `文案：\n抖音作品 <id>` 当占位。
+                // 这不是文案，落成空串，播放页整行不显示，标题回退到作者。
+                work.captionText = "";
+            } else {
+                work.captionText = caption;
+                work.title = firstLine(caption);
+            }
         }
         work.invalidateDisplay();
     }

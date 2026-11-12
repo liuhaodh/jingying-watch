@@ -60,6 +60,12 @@ public final class WatchTests {
         run("重定向凭据安全", WatchTests::httpRedirects);
         run("空文案不显示作品 ID", WatchTests::emptyCaption);
         run("图集切图与预取", WatchTests::albumNavigation);
+        run("图集动图配对", WatchTests::albumLives);
+        run("详情里的本地文件目录", WatchTests::localDirListing);
+        run("双击判定与单击延迟", WatchTests::doubleTapTiming);
+        run("播完去向与自动连播", WatchTests::playNav);
+        run("长按倍速重试", WatchTests::speedBoost);
+        run("搜索框输入节奏", WatchTests::searchInput);
 
         System.out.println();
         if (failures.isEmpty()) {
@@ -431,6 +437,36 @@ public final class WatchTests {
                 DouyinLinks.searchScheme("露营"));
         eq("网页搜索链接", "https://www.douyin.com/search/%E9%9C%B2%E8%90%A5",
                 DouyinLinks.searchWeb("露营"));
+
+        // 文案.txt 里的「作品链接：」常常是整段分享口令，不能整段塞进剪贴板
+        eq("从分享口令里抽链接",
+                "https://v.douyin.com/iRabc123/",
+                DouyinLinks.clean("7.89 复制打开抖音，看看【小鹿的作品】"
+                        + "https://v.douyin.com/iRabc123/ 复制此链接，打开抖音搜索"));
+        eq("链接尾部的中文标点去掉",
+                "https://www.douyin.com/video/7525082444551310602",
+                DouyinLinks.clean("https://www.douyin.com/video/7525082444551310602，"));
+        eq("没有链接时为空", "", DouyinLinks.clean("这段文案里没有网址"));
+        eq("空文本为空", "", DouyinLinks.clean(null));
+
+        eq("短链原样保留", "https://v.douyin.com/iRabc123/",
+                DouyinLinks.workUrl("7525082444551310602", false,
+                        "https://v.douyin.com/iRabc123/"));
+        eq("作品 id 拼视频链接", "https://www.douyin.com/video/7525082444551310602",
+                DouyinLinks.workUrl("7525082444551310602", false, ""));
+        eq("图集 id 拼图文链接", "https://www.douyin.com/note/7525082444551310602",
+                DouyinLinks.workUrl("7525082444551310602", true, ""));
+        eq("原链接是图文时沿用 /note/", "https://www.douyin.com/note/7525082444551310602",
+                DouyinLinks.workUrl("7525082444551310602", false,
+                        "https://www.douyin.com/note/7525082444551310602"));
+        eq("没有 id 时退回原链接", "https://www.douyin.com/video/123",
+                DouyinLinks.workUrl("", false, "https://www.douyin.com/video/123"));
+        eq("什么都没有时为空", "", DouyinLinks.workUrl("", false, ""));
+
+        eq("作品 deep link", "snssdk1128://aweme/detail/7525082444551310602",
+                DouyinLinks.workScheme("7525082444551310602"));
+        eq("id 不是纯数字时没有 deep link", "", DouyinLinks.workScheme("abc"));
+        eq("id 太短不认", "", DouyinLinks.workScheme("123"));
     }
 
     private static void formatting() {
@@ -900,6 +936,28 @@ public final class WatchTests {
         check("慢推不补切", !AlbumNav.flingCrossed(-60f, 800f, 1000f));
         check("位移不足不补切", !AlbumNav.flingCrossed(-30f, 60f, 1000f));
         check("时长为 0 不崩", AlbumNav.flingCrossed(-60f, 0f, 1000f));
+
+        // ---------- 抬手补切：MOVE 被合并时只剩 DOWN/UP ----------
+        eq("左划补下一张", 1, AlbumNav.swipeDirection(-120f, 8f, 160f, 1000f));
+        eq("右划补上一张", -1, AlbumNav.swipeDirection(120f, 8f, 160f, 1000f));
+        eq("纵向为主不切图", 0, AlbumNav.swipeDirection(-40f, 260f, 300f, 1000f));
+        eq("斜 45 度不切图", 0, AlbumNav.swipeDirection(-200f, 200f, 200f, 1000f));
+        eq("位移不足又慢不切图", 0, AlbumNav.swipeDirection(-20f, 4f, 900f, 1000f));
+        eq("快速小位移也补切", 1, AlbumNav.swipeDirection(-60f, 5f, 120f, 1000f));
+        eq("宽度为 0 不切图", 0, AlbumNav.swipeDirection(-500f, 0f, 100f, 0f));
+
+        // ---------- 手动切过图之后不再自动轮播 ----------
+        check("默认会轮播", AlbumNav.shouldAutoAdvance(false, false, 3, true, true));
+        check("手动切过就不轮播", !AlbumNav.shouldAutoAdvance(true, false, 3, true, true));
+        check("手动切过 + 暂停也不轮播", !AlbumNav.shouldAutoAdvance(true, true, 3, true, true));
+        check("手动切过 + 只有一张也不轮播", !AlbumNav.shouldAutoAdvance(true, false, 1, true, true));
+        check("暂停时不轮播", !AlbumNav.shouldAutoAdvance(false, true, 3, true, true));
+        check("单张图不轮播", !AlbumNav.shouldAutoAdvance(false, false, 1, true, true));
+        check("空图集不轮播", !AlbumNav.shouldAutoAdvance(false, false, 0, true, true));
+        check("非当前屏不轮播", !AlbumNav.shouldAutoAdvance(false, false, 3, false, true));
+        check("宿主在后台不轮播", !AlbumNav.shouldAutoAdvance(false, false, 3, true, false));
+        // 换作品 bind 时 manual 会被清回 false，新的图集重新开始轮播
+        check("换作品重置后恢复轮播", AlbumNav.shouldAutoAdvance(false, false, 3, true, true));
     }
 
     // ---------- 空文案不该显示作品 ID ----------
@@ -913,6 +971,36 @@ public final class WatchTests {
         check("带下划线不算作品 ID", !Work.looksLikeWorkId(id + "_20260101"));
         check("空串不算作品 ID", !Work.looksLikeWorkId(""));
         check("null 不算作品 ID", !Work.looksLikeWorkId(null));
+
+        // ---------- 电脑版对没文案的作品会写「抖音作品 <id>」占位 ----------
+        check("抖音作品占位是 ID", Work.looksLikeWorkId("抖音作品 " + id));
+        check("抖音作品占位无空格也是 ID", Work.looksLikeWorkId("抖音作品" + id));
+        check("作品ID：前缀是 ID", Work.looksLikeWorkId("作品ID：" + id));
+        check("作品id: 小写也是 ID", Work.looksLikeWorkId("作品id: " + id));
+        check("带换行尾巴的占位是 ID", Work.looksLikeWorkId("抖音作品 " + id + "\n"));
+        check("占位后面跟真文案就不是占位", !Work.looksLikeWorkId("抖音作品 " + id + "\n#露营"));
+        check("带正文的文案不是 ID", !Work.looksLikeWorkId("第 3 天露营 2026 年"));
+        check("文案里带数字不是 ID", !Work.looksLikeWorkId(id + " 的旅行日记"));
+        check("短数字加前缀算占位", Work.looksLikeWorkId("抖音作品 123"));
+
+        Work placeholder = Work.skeleton("d", "a", "小鹿", "", "小鹿_20260101_120000", 0L);
+        placeholder.captionText = "抖音作品 " + id;
+        placeholder.title = "抖音作品 " + id;
+        check("占位文案不算文案", !placeholder.hasCaption());
+        eq("占位文案不显示", "", placeholder.captionLine());
+        check("占位的展示标题不含 ID", !placeholder.displayTitle().contains(id));
+
+        Work parsed = Work.skeleton("d", "a", "小鹿", "", "小鹿_20260101_120000", 0L);
+        Work.parseCaptionText(parsed, "作者：小鹿\n作品链接：https://www.douyin.com/video/"
+                + id + "\n\n文案：\n抖音作品 " + id + "\n");
+        check("解析占位文案后仍算没有文案", !parsed.hasCaption());
+        eq("解析占位文案后不显示", "", parsed.captionLine());
+        check("解析占位后标题不含 ID", !parsed.displayTitle().contains(id));
+
+        Work legacy = Work.skeleton("d", "a", "小鹿", "", "小鹿_20260101_120000", 0L);
+        Work.parseCaptionText(legacy, "作者：小鹿\n文案：\n" + id + "\n");
+        check("旧包文案就是纯 ID 时也算没有文案", !legacy.hasCaption());
+        eq("旧包纯 ID 文案不显示", "", legacy.captionLine());
 
         Work archive = Work.archiveSkeleton("净影/Videos/小鹿_1/" + id + ".tar",
                 "净影/Videos/小鹿_1", "小鹿", "1", id + ".tar", 1024L, 1_700_000_000L);
@@ -975,6 +1063,319 @@ public final class WatchTests {
             }
             return read == bytes.length ? bytes : Arrays.copyOf(bytes, read);
         }
+    }
+
+    // ---------- 详情里的本地文件目录 ----------
+    // ---------- 图集动图配对 ----------
+    private static void albumLives() {
+        Work work = album("图集_动图", new String[][]{
+                {"图片_01.jpg", "100"}, {"图片_02.jpg", "100"}, {"图片_03.jpg", "100"},
+                {"动图_01.mp4", "300"}, {"动图_03.mp4", "300"}});
+        check("只有图片时算图集", work != null && work.isAlbum());
+        if (work == null) {
+            return;
+        }
+        check("识别到动图", work.hasLives());
+        eq("动图数量", 2, work.lives.size());
+        eq("第一张配对动图_01", "动图_01.mp4",
+                work.liveFor(0) == null ? null : work.liveFor(0).name);
+        eq("第二张没有动图", null, work.liveFor(1));
+        eq("第三张配对动图_03", "动图_03.mp4",
+                work.liveFor(2) == null ? null : work.liveFor(2).name);
+        eq("越界返回 null", null, work.liveFor(9));
+        eq("负数返回 null", null, work.liveFor(-1));
+        eq("动图计入作品体积", 900L, work.totalBytes());
+
+        Work plain = album("图集_无动图", new String[][]{
+                {"图片_01.jpg", "100"}, {"图片_02.jpg", "100"}});
+        check("没有动图的图集", plain != null && !plain.hasLives());
+        eq("没有动图时返回 null", null, plain == null ? null : plain.liveFor(0));
+
+        // 旧包文件名里没有序号：数量一致就按下标配，不然没法知道哪张对哪张
+        Work noIndex = album("图集_无序号", new String[][]{
+                {"封面.jpg", "100"}, {"细节.jpg", "100"},
+                {"动图A.mp4", "300"}, {"动图B.mp4", "300"}});
+        check("无序号也能配到动图", noIndex != null && noIndex.liveFor(0) != null);
+        check("无序号第二张也配到", noIndex != null && noIndex.liveFor(1) != null);
+
+        // 数量对不上又没序号：不能瞎配，宁可不播（退回静态图）
+        Work mismatch = album("图集_数量不符", new String[][]{
+                {"封面.jpg", "100"}, {"细节.jpg", "100"}, {"花絮.jpg", "100"},
+                {"动图A.mp4", "300"}, {"动图B.mp4", "300"}});
+        eq("数量不符时不硬配", null, mismatch == null ? null : mismatch.liveFor(0));
+    }
+
+    /** 构造一个图集作品：pairs 是 {文件名, 体积}。 */
+    private static Work album(String folder, String[][] pairs) {
+        List<RemoteFile> files = new ArrayList<>();
+        for (String[] pair : pairs) {
+            files.add(new RemoteFile("d/" + pair[0], pair[0], Long.parseLong(pair[1])));
+        }
+        return Work.fromFiles("d", "a", "作者", "1", folder, 0L, files, true, null);
+    }
+
+    private static void localDirListing() {
+        try {
+            File base = new File("android/build/local-files-" + System.nanoTime());
+            File dir = new File(base, "w0123456789abcdef");
+            check("创建离线目录", dir.mkdirs());
+
+            check("null 不算已下载", !LocalFiles.isDownloaded(null));
+            check("不存在的目录不算已下载",
+                    !LocalFiles.isDownloaded(new File(base, "missing")));
+            check("空目录不算已下载", !LocalFiles.isDownloaded(dir));
+            eq("空目录清单为空", "", LocalFiles.listing(dir, 6));
+
+            // 下载中：只有 .part，没有完成标记 meta.json
+            sizedFile(new File(dir, "视频.mp4.part"), 1234);
+            check("下载中不算已下载", !LocalFiles.isDownloaded(dir));
+            eq("下载中的临时文件不进清单", "", LocalFiles.listing(dir, 6));
+            check("清掉临时文件", new File(dir, "视频.mp4.part").delete());
+
+            // 只有完成标记、作品文件被清空（下载失败清理过）也不算
+            sizedFile(new File(dir, "meta.json"), 20);
+            check("只有 meta.json 不算已下载", !LocalFiles.isDownloaded(dir));
+            eq("只剩标记时清单为空", "", LocalFiles.listing(dir, 6));
+
+            // 下载完成：媒体 + 文案 + 一堆应当被忽略的杂物
+            sizedFile(new File(dir, "视频.mp4"), 2 * 1024 * 1024);
+            sizedFile(new File(dir, "图片_01.jpg"), 1024);
+            sizedFile(new File(dir, "文案.txt"), 48);
+            sizedFile(new File(dir, ".nomedia"), 0);
+            sizedFile(new File(dir, "音乐.mp3.tmp"), 999);
+            sizedFile(new File(dir, "音乐.mp3.part"), 999);
+            //noinspection ResultOfMethodCallIgnored
+            new File(dir, "子目录").mkdirs();
+            check("完成标记 + 作品文件 = 已下载", LocalFiles.isDownloaded(dir));
+
+            List<File> listed = LocalFiles.files(dir);
+            eq("杂物被过滤，只剩 3 个作品文件", 3, listed.size());
+            eq("文件名排序 1", "图片_01.jpg", listed.get(0).getName());
+            eq("文件名排序 2", "文案.txt", listed.get(1).getName());
+            eq("文件名排序 3", "视频.mp4", listed.get(2).getName());
+
+            String all = LocalFiles.listing(dir, 6);
+            eq("清单行数", 3, all.split("\n", -1).length);
+            check("清单含视频名", all.contains("视频.mp4"));
+            check("清单含人类可读体积", all.contains(Util.humanSize(2 * 1024 * 1024)));
+            check("没超出上限就不折叠", !all.contains("还有"));
+
+            String folded = LocalFiles.listing(dir, 2);
+            eq("折叠后行数", 3, folded.split("\n", -1).length);
+            check("折叠提示写明剩余数量", folded.contains("还有 1 个文件"));
+
+            String minimum = LocalFiles.listing(dir, 0);
+            eq("maxLines=0 至少列 1 个 + 折叠行", 2,
+                    minimum.split("\n", -1).length);
+
+            // 中文名 + 0 字节文件也要能正常显示
+            File emptyDir = new File(base, "empty");
+            //noinspection ResultOfMethodCallIgnored
+            emptyDir.mkdirs();
+            sizedFile(new File(emptyDir, "meta.json"), 8);
+            sizedFile(new File(emptyDir, "空文案.txt"), 0);
+            check("中文名空文件也算已下载", LocalFiles.isDownloaded(emptyDir));
+            eq("空文件体积", "空文案.txt  ·  0 B", LocalFiles.listing(emptyDir, 6));
+        } catch (Throwable exc) {
+            failures.add("详情里的本地文件目录 抛出异常：" + exc);
+        }
+    }
+
+    private static void sizedFile(File file, int length) throws IOException {
+        try (FileOutputStream output = new FileOutputStream(file)) {
+            byte[] chunk = new byte[Math.min(length, 1024)];
+            int left = length;
+            while (left > 0) {
+                int step = Math.min(left, chunk.length);
+                output.write(chunk, 0, step);
+                left -= step;
+            }
+        }
+    }
+
+    // ---------- 双击判定与单击延迟 ----------
+    private static void doubleTapTiming() {
+        int window = TapNav.DOUBLE_TAP_WINDOW_MS;
+        int slop = 24;
+        long lastUp = 1000L;
+        check("单击延迟必须严格大于双击窗口",
+                TapNav.SINGLE_TAP_DELAY_MS > window);
+        check("没有待判定的单击就不是双击",
+                !TapNav.isDoubleTap(false, 100, 200, 100, 200,
+                        lastUp + 120, lastUp, slop));
+        check("同位置短间隔 = 双击",
+                TapNav.isDoubleTap(true, 100, 200, 100, 200,
+                        lastUp + 120, lastUp, slop));
+        check("立即再按（间隔 0）也算双击",
+                TapNav.isDoubleTap(true, 100, 200, 100, 200, lastUp, lastUp, slop));
+        check("刚好等于窗口仍算双击",
+                TapNav.isDoubleTap(true, 100, 200, 100, 200,
+                        lastUp + window, lastUp, slop));
+        check("超出窗口 1ms 就不算",
+                !TapNav.isDoubleTap(true, 100, 200, 100, 200,
+                        lastUp + window + 1, lastUp, slop));
+        check("慢双击（300ms 后）不算",
+                !TapNav.isDoubleTap(true, 100, 200, 100, 200,
+                        lastUp + 300, lastUp, slop));
+        check("时间倒流不算",
+                !TapNav.isDoubleTap(true, 100, 200, 100, 200,
+                        lastUp - 1, lastUp, slop));
+        check("横向位移刚好等于 slop 仍算",
+                TapNav.isDoubleTap(true, 100 + slop, 200, 100, 200,
+                        lastUp + 120, lastUp, slop));
+        check("横向位移超 slop 不算",
+                !TapNav.isDoubleTap(true, 100 + slop + 1, 200, 100, 200,
+                        lastUp + 120, lastUp, slop));
+        check("纵向位移超 slop 不算",
+                !TapNav.isDoubleTap(true, 100, 200 + slop + 1, 100, 200,
+                        lastUp + 120, lastUp, slop));
+        check("两下离得远不算",
+                !TapNav.isDoubleTap(true, 400, 600, 100, 200,
+                        lastUp + 120, lastUp, slop));
+        check("slop 为 0 时稍偏就不算",
+                !TapNav.isDoubleTap(true, 101, 200, 100, 200,
+                        lastUp + 120, lastUp, 0));
+        // 核心不变式：判定成立时，第一下的单击一定还没到执行时间
+        long firedAt = lastUp + TapNav.SINGLE_TAP_DELAY_MS;
+        long latestSecondDown = lastUp + window;
+        check("判定成立时待执行的单击还没触发", latestSecondDown < firedAt);
+        check("窗口不比系统 300ms 更长，单击不发钝", window <= 300);
+    }
+
+    // ---------- 播完去向：自动连播开关 ----------
+
+    private static void playNav() {
+        long grace = PlayNav.TOUCH_GRACE_MS;
+
+        // 四种开关 / 是否有下一条的组合
+        eq("连播开 + 有下一条 → 下一个", PlayNav.NEXT,
+                PlayNav.afterEnded(true, true, grace));
+        eq("连播关 + 有下一条 → 停住重播", PlayNav.REPLAY,
+                PlayNav.afterEnded(false, true, grace));
+        eq("连播开 + 最后一条 → 停住重播", PlayNav.REPLAY,
+                PlayNav.afterEnded(true, false, grace));
+        eq("连播关 + 最后一条 → 停住重播", PlayNav.REPLAY,
+                PlayNav.afterEnded(false, false, grace));
+
+        // 刚滑过 / 正在滑的宽限：上一条刚好播完不能把用户顶走
+        eq("宽限内差 1ms → 不动", PlayNav.IGNORE,
+                PlayNav.afterEnded(true, true, grace - 1));
+        eq("宽限边界整好 → 按设置走", PlayNav.NEXT,
+                PlayNav.afterEnded(true, true, grace));
+        eq("刚抬手 0ms → 不动", PlayNav.IGNORE,
+                PlayNav.afterEnded(true, true, 0));
+        eq("时钟回退（负值）→ 不动", PlayNav.IGNORE,
+                PlayNav.afterEnded(true, true, -5000));
+        eq("宽限内即使关了连播也别重播", PlayNav.IGNORE,
+                PlayNav.afterEnded(false, true, 100));
+
+        // 常量自身的不变式
+        check("宽限时间为正数", grace > 0);
+        check("三种去向互不相同", PlayNav.IGNORE != PlayNav.NEXT
+                && PlayNav.NEXT != PlayNav.REPLAY
+                && PlayNav.IGNORE != PlayNav.REPLAY);
+    }
+
+    private static void speedBoost() {
+        SpeedNav nav = new SpeedNav();
+        eq("目标倍速 2×", 2f, SpeedNav.BOOST);
+        eq("第一次用带 pitch 的写法", 0, nav.variant());
+        check("新一次长按立刻就能试", nav.shouldAttempt(0));
+        check("还没试过不算失败", nav.failures() == 0 && !nav.unsupported());
+        eq("长按提示", "2× 播放中", nav.label());
+
+        nav.markAttempt(1000);
+        check("退避内不重复设置倍速", !nav.shouldAttempt(1200));
+        check("退避到点可以再试", nav.shouldAttempt(1300));
+
+        nav.onFailure();
+        eq("失败后换第二种写法", 1, nav.variant());
+        eq("失败一次还不算不支持", 1, nav.failures());
+        eq("失败后间隔拉长到 600ms", 600L, nav.retryDelayMs());
+        nav.markAttempt(2000);
+        check("差 300ms 还没到 600ms", !nav.shouldAttempt(2300));
+
+        nav.onFailure();
+        eq("再失败换第三种写法", 2, nav.variant());
+        nav.onFailure();
+        eq("写法封顶不越界", 2, nav.variant());
+        eq("第三次失败后间隔 1200ms", 1200L, nav.retryDelayMs());
+
+        // 一旦成功就清零，别把重试计数带回去
+        nav.onSuccess();
+        eq("成功后失败计数清零", 0, nav.failures());
+        check("成功标记已生效", nav.applied());
+        eq("清零后间隔回到 300ms", 300L, nav.retryDelayMs());
+
+        // 试到上限才说不支持
+        SpeedNav doomed = new SpeedNav();
+        for (int i = 0; i < SpeedNav.MAX_FAILURES - 1; i++) {
+            doomed.onFailure();
+        }
+        check("差一次还不算不支持", !doomed.unsupported());
+        eq("差一次时提示仍是 2×", "2× 播放中", doomed.label());
+        doomed.onFailure();
+        check("试满上限才判不支持", doomed.unsupported());
+        eq("不支持的提示", "本机不支持倍速", doomed.label());
+        check("判不支持后不再尝试", !doomed.shouldAttempt(Long.MAX_VALUE / 2));
+
+        // 累计退避要够长：页面刚进来缓冲那几百毫秒的失败不能就把结论定死
+        long total = 0;
+        for (int failures = 0; failures < SpeedNav.MAX_FAILURES; failures++) {
+            SpeedNav probe = new SpeedNav();
+            for (int i = 0; i < failures; i++) {
+                probe.onFailure();
+            }
+            total += probe.retryDelayMs();
+        }
+        check("试到上限要花 5 秒以上（共 " + total + "ms）", total >= 5000L);
+
+        // 播放状态变了：清失败计数、但保留已经试出来的写法
+        SpeedNav again = new SpeedNav();
+        again.onFailure();
+        again.onFailure();
+        again.restart();
+        eq("restart 清失败计数", 0, again.failures());
+        eq("restart 保留写法", 2, again.variant());
+        again.reset();
+        eq("reset 回到第一种写法", 0, again.variant());
+
+        SpeedNav apiLow = new SpeedNav();
+        apiLow.giveUp();
+        check("低版本直接判不支持", apiLow.unsupported());
+        eq("低版本提示", "本机不支持倍速", apiLow.label());
+    }
+
+    private static void searchInput() {
+        eq("null 归一成空串", "", SearchNav.normalize(null));
+        eq("去掉首尾空格", "露营", SearchNav.normalize("  露营  "));
+        eq("全空格等于空", "", SearchNav.normalize("   "));
+
+        // 防抖：普通输入要等，删空立刻生效
+        eq("普通输入走 260ms 防抖", SearchNav.DEBOUNCE_MS,
+                SearchNav.delayMs("露营", false));
+        eq("删空立刻生效", 0L, SearchNav.delayMs("", false));
+        eq("只剩空格也算删空", 0L, SearchNav.delayMs("   ", false));
+        eq("null 当删空", 0L, SearchNav.delayMs(null, false));
+        eq("拼音还没上屏先等 120ms", SearchNav.COMPOSING_MS,
+                SearchNav.delayMs("luying", true));
+        eq("组合输入时即使框里是空的也先等", SearchNav.COMPOSING_MS,
+                SearchNav.delayMs("", true));
+
+        // 组合输入的等待上限：输入法一直不提交也不能永远不筛
+        check("组合输入第一次等", SearchNav.waitForComposing(true, 0));
+        check("等满上限就不再等", !SearchNav.waitForComposing(true,
+                SearchNav.MAX_COMPOSING_WAITS));
+        check("不在组合输入就不等", !SearchNav.waitForComposing(false, 0));
+        check("等待上限是正数", SearchNav.MAX_COMPOSING_WAITS > 0);
+
+        // 关键词没变就别重建 1.6 万条的列表
+        check("换关键词要重建", SearchNav.needsRebuild("露营", "露营 湖"));
+        check("删字要重建", SearchNav.needsRebuild("露营", "露"));
+        check("只是首尾空格变化不重建", !SearchNav.needsRebuild("露营", " 露营 "));
+        check("删空要重建", SearchNav.needsRebuild("露营", ""));
+        check("本来就是空又删一次不重建", !SearchNav.needsRebuild("", "  "));
+        check("null 和空串等价", !SearchNav.needsRebuild(null, ""));
     }
 
     private static String readFile(File file) throws IOException {

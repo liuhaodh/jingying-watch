@@ -274,6 +274,24 @@ public final class OfflineStore {
         return file.isFile() ? file : null;
     }
 
+    /**
+     * 第 index 张图配对的动图视频（`动图_01.mp4`）。没下载过 / 这一张没有动图时返回 null，
+     * 播放页会自动退回静态图。
+     */
+    public File localLive(Work work, int index) {
+        ensureLoaded();
+        Work stored = saved.get(work.rel);
+        if (stored == null || stored.archive != null) {
+            return null;
+        }
+        RemoteFile live = stored.liveFor(index);
+        if (live == null) {
+            return null;
+        }
+        File file = new File(dirFor(stored), live.name);
+        return file.isFile() ? file : null;
+    }
+
     public File localMusic(Work work) {
         ensureLoaded();
         Work stored = saved.get(work.rel);
@@ -365,7 +383,7 @@ public final class OfflineStore {
         notifyChanged(null);
     }
 
-    /** 只统计真正会下载的文件（实况图 lives 不下载，不能算进进度分母）。 */
+    /** 统计真正会下载的文件（含图集里的实况动图，离线观看才动得起来）。 */
     private static long downloadBytes(Work work) {
         if (work.archive != null) {
             return Math.max(0L, work.archive.size);
@@ -376,6 +394,9 @@ public final class OfflineStore {
         }
         for (RemoteFile image : work.images) {
             total += image.size;
+        }
+        for (RemoteFile live : work.lives) {
+            total += live.size;
         }
         if (work.music != null) {
             total += work.music.size;
@@ -441,6 +462,15 @@ public final class OfflineStore {
             }
             for (RemoteFile image : work.images) {
                 done = downloadFile(work, image, new File(dir, image.name), done, total);
+            }
+            // 实况动图：和图片一起存下来，否则离线看图集只有静态照片。单个动图失败
+            // 不连带整个作品失败（退回静态图仍可看），所以单独兜住。
+            for (RemoteFile live : work.lives) {
+                try {
+                    done = downloadFile(work, live, new File(dir, live.name), done, total);
+                } catch (Exception exc) {
+                    android.util.Log.w("JYWatch", "live skip " + live.name, exc);
+                }
             }
             if (work.music != null) {
                 done = downloadFile(work, work.music, new File(dir, work.music.name),

@@ -59,11 +59,11 @@ public final class FeedPager extends ViewGroup {
     private volatile long lastTouchAt;
     private float scrubFraction;
     private final int touchSlop;
-    /** 双击窗口：比系统 300ms 略短，单击暂停不至于明显发钝。 */
-    private static final int DOUBLE_TAP_TIMEOUT_MS = 260;
     private final int doubleTapSlop;
     private final float density;
     private Runnable pendingSingleTap;
+    /** 第二下已按下、只等抬手确认：抬手时直接触发收藏，不再排一个会暂停的单击。 */
+    private boolean doubleTapPending;
     private long lastTapTime;
     private float lastTapX;
     private float lastTapY;
@@ -455,6 +455,21 @@ public final class FeedPager extends ViewGroup {
                 if (downPage != null) {
                     downPage.onAlbumTouchDown();
                 }
+                // 双击判定必须在 DOWN 做。以前放在 UP，而单击延迟和双击窗口同为 260ms：
+                // 两下间隔刚好跨过边界时，第一下的「暂停」已经执行完，第二下才来判定，
+                // 于是收藏没触发、画面却被暂停 —— 就是「双击有概率暂停」。
+                // 判定基准改成「上次抬手 → 这次按下」，还多出一个按压时长的余量。
+                boolean secondTap = TapNav.isDoubleTap(pendingSingleTap != null,
+                        downX, downY, lastTapX, lastTapY,
+                        downTime, lastTapTime, doubleTapSlop);
+                if (secondTap) {
+                    // 单击延迟严格大于双击窗口，这里一定来得及撤掉还没执行的单击。
+                    // 即使第二下按到了按钮/话题上也要撤，否则第一下仍会在双击期间暂停。
+                    cancelPendingSingleTap();
+                }
+                doubleTapPending = secondTap && downPage != null
+                        && downPage.hitTest(downX, downY) == FeedPage.HIT_NONE
+                        && !downPage.hasCaptionTokenAt(downX, downY);
                 longPressFired = false;
                 // 上一次图集左右滑留下的「别当点击」标记必须清掉，
                 // 否则滑完图集后的第一次点击会被吞掉
@@ -462,18 +477,20 @@ public final class FeedPager extends ViewGroup {
                 // 进度条上按住是在拖动进度，不能同时触发 2× 长按
                 boolean onProgress = downPage != null && downPage.isScrubbable()
                         && downPage.isInProgressTouchZone(downY);
-                if (!onProgress) {
+                if (!onProgress && !secondTap) {
                     handler.postDelayed(longPressRunnable, 420);
                 }
                 return true;
             case MotionEvent.ACTION_POINTER_DOWN:
                 multiTouch = true;
+                doubleTapPending = false;
                 cancelLongPressCallback();
                 cancelPendingSingleTap();
                 return true;
             case MotionEvent.ACTION_POINTER_UP:
                 // 多指抬起后不要再把这次手势当成点击/翻页
                 multiTouch = true;
+                doubleTapPending = false;
                 cancelLongPressCallback();
                 cancelPendingSingleTap();
                 return true;
@@ -614,6 +631,27 @@ public final class FeedPager extends ViewGroup {
                     horizontalGesture = false;
                     return true;
                 }
+                // MOVE 事件被系统合并时，下面「!dragging && |rawUpDy| > slop*2」那段只会
+                // 补竖直翻页，图集横滑彻底没兜底：手指划过去了，结果被当成一次点击，
+                // 画面还停在第 1 张（顺手还把图集暂停了）。这里按整段位移补切一张。
+                if (!dragging && !horizontalGesture) {
+                    FeedPage albumPage = currentPage();
+                    if (albumPage != null && albumPage.work() != null
+                            && albumPage.work().isAlbum()
+                            && !(albumPage.isScrubbable()
+                            && albumPage.isInProgressTouchZone(downY))) {
+                        int direction = AlbumNav.swipeDirection(event.getX() - downX,
+                                rawUpDy, gestureMs, getWidth());
+                        if (direction != 0) {
+                            if (direction < 0) {
+                                albumPage.previousAlbum();
+                            } else {
+                                albumPage.advanceAlbum();
+                            }
+                            return true;
+                        }
+                    }
+                }
                 // 快速轻扫时系统可能把 MOVE 事件合并掉，只剩 DOWN/UP：
                 // 这时按抬手位移和手势时长补一次翻页，避免被当成点击。
                 if (!dragging && Math.abs(rawUpDy) > touchSlop * 2f) {
@@ -650,9 +688,24 @@ public final class FeedPager extends ViewGroup {
                     suppressTapUntilUp = false;
                     return true;
                 }
+                // 能走到这里说明这一下是干净的点击（滑动 / 长按 / 切图 / 多指都在上面
+                // return 了）。双击在 DOWN 已判定并撤掉待执行的单击，抬手直接触发收藏，
+                // 绝不再排一个会暂停的单击。
+                if (doubleTapPending) {
+                    doubleTapPending = false;
+                    FeedPage doublePage = currentPage();
+                    if (doublePage != null && listener != null
+                            && doublePage.hitTest(event.getX(), event.getY())
+                            == FeedPage.HIT_NONE) {
+                        listener.onDoubleTap(doublePage, event.getX(), event.getY());
+                        return true;
+                    }
+                    // 抬手时偏到了按钮 / 话题上：按普通单击处理，别吞掉
+                }
                 handleTap(event);
                 return true;
             case MotionEvent.ACTION_CANCEL:
+                doubleTapPending = false;
                 cancelLongPressCallback();
                 cancelPendingSingleTap();
                 if (longPressFired) {
@@ -711,25 +764,17 @@ public final class FeedPager extends ViewGroup {
             firePendingSingleTap();
             return;
         }
-        // 内容区：单击暂停/继续，双击收藏。第一下先等一个双击窗口，
-        // 否则两下会变成「暂停 + 继续」，画面白闪一次。
-        long now = event.getEventTime();
+        // 内容区：单击暂停/继续。双击判定已经在 ACTION_DOWN 做完，这里只负责把
+        // 单击延后一个双击窗口，避免两下变成「暂停 + 继续」白闪一次。
         if (pendingSingleTap != null) {
-            boolean close = Math.abs(x - lastTapX) <= doubleTapSlop
-                    && Math.abs(y - lastTapY) <= doubleTapSlop;
+            // 第二下没被认成双击（离得远 / 略慢）：先补上第一下，别丢点击，
+            // 也别让旧的 runnable 把这一下新排的单击顶掉。
             cancelPendingSingleTap();
-            if (close && now - lastTapTime <= DOUBLE_TAP_TIMEOUT_MS) {
-                if (listener != null) {
-                    listener.onDoubleTap(page, x, y);
-                }
-                return;
-            }
-            // 两下离得太远：先补上第一下的单击，这一下再按新的单击处理
             if (listener != null) {
                 listener.onTap(page, FeedPage.HIT_NONE, lastTapX, lastTapY);
             }
         }
-        lastTapTime = now;
+        lastTapTime = event.getEventTime();
         lastTapX = x;
         lastTapY = y;
         final FeedPage tapPage = page;
@@ -739,7 +784,7 @@ public final class FeedPager extends ViewGroup {
                 listener.onTap(tapPage, FeedPage.HIT_NONE, x, y);
             }
         };
-        handler.postDelayed(pendingSingleTap, DOUBLE_TAP_TIMEOUT_MS);
+        handler.postDelayed(pendingSingleTap, TapNav.SINGLE_TAP_DELAY_MS);
     }
 
     /** 立刻把待判定的单击执行掉（点到按钮 / 话题时，不能吞掉上一击）。 */
@@ -855,6 +900,7 @@ public final class FeedPager extends ViewGroup {
     public void destroy() {
         handler.removeCallbacksAndMessages(null);
         pendingSingleTap = null;
+        doubleTapPending = false;
         for (FeedPage page : pages) {
             page.destroy();
         }

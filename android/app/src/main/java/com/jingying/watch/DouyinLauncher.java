@@ -104,6 +104,38 @@ public final class DouyinLauncher {
         Ui.toast(activity, "无法打开抖音搜索");
     }
 
+    /**
+     * 在抖音里打开这个作品。
+     *
+     * 先走 `snssdk1128://aweme/detail/<作品id>`：抖音 App 直接进作品页，
+     * 不经过浏览器（网页链接在未登录浏览器里常常只显示「打开抖音观看」，
+     * 看起来就是「链接打不开」）。取不到作品 id 或 scheme 没接住时，
+     * 再点名抖音包名打开网页链接，最后才交给系统。
+     */
+    public static void openWork(Activity activity, String awemeId, String shareUrl,
+                                boolean album) {
+        if (activity == null || activity.isFinishing()) {
+            return;
+        }
+        String id = DouyinLinks.digits(awemeId);
+        String url = DouyinLinks.workUrl(id, album, shareUrl);
+        if (!id.isEmpty()) {
+            String scheme = DouyinLinks.workScheme(id);
+            if (openIn(activity, scheme, DOUYIN) || openIn(activity, scheme, DOUYIN_LITE)) {
+                return;
+            }
+        }
+        if (!url.isEmpty()) {
+            if (openIn(activity, url, DOUYIN) || openIn(activity, url, DOUYIN_LITE)) {
+                return;
+            }
+            if (open(activity, url)) {
+                return;
+            }
+        }
+        Ui.toast(activity, "这个作品没有可用的抖音链接");
+    }
+
     /** 复制主页链接：sec_uid 无效时退成搜索链接，方便手动粘到抖音或浏览器。 */
     public static void copyLink(Activity activity, String authorName,
                                 String uniqueId, String secUid) {

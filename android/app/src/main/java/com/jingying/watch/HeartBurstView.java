@@ -2,7 +2,6 @@ package com.jingying.watch;
 
 import android.content.Context;
 import android.graphics.Canvas;
-import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.view.View;
@@ -11,15 +10,20 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
-/** 双击点赞时从手指位置冒出来的小心心。 */
+/** 双击收藏时从手指位置冒出来的心心。 */
 public final class HeartBurstView extends View {
 
-    private static final long LIFE_MS = 780L;
+    private static final long LIFE_MS = 900L;
+    /** 主心心基准边长（dp）；配合放大动画峰值约 120dp，和抖音的手感接近。 */
+    private static final float HEART_SIZE_DP = 96f;
+    /** 三颗心按手指位置散开，别叠成一坨。 */
+    private static final float SIDE_OFFSET_DP = 34f;
+    /** 连续双击时别让列表无限涨。 */
+    private static final int MAX_BURSTS = 15;
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path heart = new Path();
     private final List<Burst> bursts = new ArrayList<>();
-    private Runnable ticker;
 
     public HeartBurstView(Context context) {
         super(context);
@@ -44,10 +48,14 @@ public final class HeartBurstView extends View {
 
     public void burst(float x, float y) {
         long now = System.currentTimeMillis();
+        while (bursts.size() + 3 > MAX_BURSTS) {
+            bursts.remove(0);
+        }
+        int side = Ui.dp(getContext(), SIDE_OFFSET_DP);
         bursts.add(new Burst(x, y, now, 0f, 1f));
-        bursts.add(new Burst(x - Ui.dp(getContext(), 10), y + Ui.dp(getContext(), 6),
+        bursts.add(new Burst(x - side, y + Ui.dp(getContext(), 18),
                 now + 60, -16f, 0.72f));
-        bursts.add(new Burst(x + Ui.dp(getContext(), 11), y + Ui.dp(getContext(), 9),
+        bursts.add(new Burst(x + side + Ui.dp(getContext(), 2), y + Ui.dp(getContext(), 26),
                 now + 120, 18f, 0.62f));
         invalidate();
     }
@@ -57,7 +65,7 @@ public final class HeartBurstView extends View {
         super.onDraw(canvas);
         long now = System.currentTimeMillis();
         boolean active = false;
-        float unit = Ui.dpf(getContext(), 22);
+        float unit = Ui.dpf(getContext(), HEART_SIZE_DP);
         for (Iterator<Burst> iterator = bursts.iterator(); iterator.hasNext(); ) {
             Burst burst = iterator.next();
             long life = now - burst.start;
@@ -76,7 +84,7 @@ public final class HeartBurstView extends View {
             float alpha = (1f - t) * (1f - t);
             paint.setAlpha((int) (255 * alpha));
             canvas.save();
-            canvas.translate(burst.x, burst.y - Ui.dpf(getContext(), 26) * t);
+            canvas.translate(burst.x, burst.y - Ui.dpf(getContext(), 64) * t);
             canvas.rotate(burst.rotation + 10f * (float) Math.sin(t * 8));
             float factor = unit / 24f * scale;
             canvas.scale(factor, factor);

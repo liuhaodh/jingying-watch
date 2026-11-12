@@ -9,11 +9,14 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.Editable;
+import android.text.InputType;
 import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
+import android.view.inputmethod.BaseInputConnection;
+import android.view.inputmethod.EditorInfo;
 import android.widget.BaseAdapter;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -78,10 +81,42 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
     private TextView continueText;
     private ProgressBar scanProgress;
     private EditText search;
-    /** 搜索防抖：停手 220ms 再筛，别每敲一个字就过一遍全库。 */
-    private final Runnable searchRunnable = () -> {
-        query = search == null ? "" : search.getText().toString().trim();
-        rebuildDisplayed();
+    private ImageView searchClear;
+    /** 为「拼音还没上屏」多等了几次，防止输入法一直不提交就一直不筛。 */
+    private int searchWaits;
+    /**
+     * 关键词真正生效的地方。
+     *
+     * 只在「输入法组合已结束 + 关键词确实变了」时重建列表：
+     * 拼音还没上屏时筛出来的是 "luying" 这种字母串，结果一定不对，
+     * 删中文字时列表也会跟着乱跳 —— 这就是搜索框删字看起来不正常的主要原因。
+     * 删空 / 点 × 走 {@link #applySearchNow()}，立刻恢复全量，不等防抖。
+     */
+    private final Runnable searchRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (search == null) {
+                return;
+            }
+            if (SearchNav.waitForComposing(searchComposing(), searchWaits)) {
+                searchWaits++;
+                handler.removeCallbacks(this);
+                handler.postDelayed(this, SearchNav.COMPOSING_MS);
+                return;
+            }
+            searchWaits = 0;
+            String next = SearchNav.normalize(search.getText().toString());
+            if (!SearchNav.needsRebuild(query, next)) {
+                return;
+            }
+            query = next;
+            rebuildKeepingCursor();
+            // 换关键词后回到列表顶部：否则删掉关键词时列表还停在之前的位置，
+            // 看起来就像「没恢复全量」
+            if (list != null) {
+                list.setSelectionFromTop(0, 0);
+            }
+        }
     };
     private LinearLayout chipsBox;
     private HorizontalScrollView chipsScroll;
@@ -360,9 +395,15 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
         search.setTextColor(Ui.TEXT);
         search.setTextSize(14);
         search.setSingleLine(true);
+        // 关掉输入法的「建议/自动纠错」：中文搜索框里被自动补全成别的词
+        // 只会让人以为删字删错了
+        search.setInputType(InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        search.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
         search.setPadding(Ui.dp(this, 8), 0, 0, 0);
-        searchBox.addView(search, new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        LinearLayout.LayoutParams editParams = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+        searchBox.addView(search, editParams);
         search.addTextChangedListener(new TextWatcher() {
             @Override
             public void beforeTextChanged(CharSequence s, int start, int count, int after) {
@@ -370,15 +411,42 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
 
             @Override
             public void onTextChanged(CharSequence s, int start, int before, int count) {
-                // 每敲一个字就过一遍 1.6 万条太贵：停手 220ms 再筛
                 handler.removeCallbacks(searchRunnable);
-                handler.postDelayed(searchRunnable, 220L);
+                searchWaits = 0;
+                syncSearchClear();
+                String text = s == null ? "" : s.toString();
+                if (SearchNav.normalize(text).isEmpty()) {
+                    // 删空了：立刻恢复全量，别让用户等一个防抖
+                    applySearchNow();
+                    return;
+                }
+                long delay = SearchNav.delayMs(text, SearchNav.waitForComposing(searchComposing(), 0));
+                handler.postDelayed(searchRunnable, delay);
             }
 
             @Override
             public void afterTextChanged(Editable s) {
             }
         });
+
+        // 一键清空：删字删到一半（尤其光标跑到字中间）时比连按退格可靠
+        searchClear = Ui.icon(this, R.drawable.ic_close, 14, Ui.FAINT);
+        searchClear.setFocusable(false);
+        searchClear.setVisibility(View.GONE);
+        searchClear.setOnClickListener(view -> {
+            if (search == null) {
+                return;
+            }
+            search.setText("");
+            search.setSelection(0);
+            search.requestFocus();
+            syncSearchClear();
+            applySearchNow();
+        });
+        LinearLayout.LayoutParams clearParams = new LinearLayout.LayoutParams(
+                Ui.dp(this, 28), ViewGroup.LayoutParams.MATCH_PARENT);
+        clearParams.leftMargin = Ui.dp(this, 4);
+        searchBox.addView(searchClear, clearParams);
 
         // 作者筛选
         chipsScroll = new HorizontalScrollView(this);
@@ -508,6 +576,69 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
             emptyText.setVisibility(View.GONE);
             emptyAction.setVisibility(View.GONE);
         }
+    }
+
+    /** 输入法是否还在组合输入（拼音没上屏）；这时输入框里是字母串，不能拿来筛。 */
+    private boolean searchComposing() {
+        if (search == null) {
+            return false;
+        }
+        try {
+            Editable text = search.getText();
+            return text != null && BaseInputConnection.getComposingSpanStart(text) != -1;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    /** 关键词立刻生效（删空 / 点 × 清空）：不等防抖，马上恢复全量列表。 */
+    private void applySearchNow() {
+        handler.removeCallbacks(searchRunnable);
+        searchWaits = 0;
+        String next = SearchNav.normalize(search == null ? "" : search.getText().toString());
+        if (!SearchNav.needsRebuild(query, next)) {
+            return;
+        }
+        query = next;
+        rebuildKeepingCursor();
+        if (list != null) {
+            list.setSelectionFromTop(0, 0);
+        }
+    }
+
+    /**
+     * 重建列表时保住输入框的光标。
+     *
+     * ListView 重新布局有可能把输入框的选区打回 0：光标跳到开头之后，
+     * 按退格什么也删不掉 —— 这就是「搜索框删字不正常」最典型的那种表现。
+     * 只有文本本身没变时才恢复，变了就说明光标位置已经另有含义。
+     */
+    private void rebuildKeepingCursor() {
+        int start = search == null ? -1 : search.getSelectionStart();
+        int end = search == null ? -1 : search.getSelectionEnd();
+        String before = search == null ? "" : search.getText().toString();
+        rebuildDisplayed();
+        if (search == null || start < 0 || end < 0) {
+            return;
+        }
+        if (!before.equals(search.getText().toString())) {
+            return;
+        }
+        if (search.getSelectionStart() != start || search.getSelectionEnd() != end) {
+            try {
+                search.setSelection(start, end);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    /** 输入框里有字才显示「清空」。 */
+    private void syncSearchClear() {
+        if (searchClear == null || search == null) {
+            return;
+        }
+        boolean hasText = search.getText().length() > 0;
+        searchClear.setVisibility(hasText ? View.VISIBLE : View.GONE);
     }
 
     private void renderStats() {
@@ -777,9 +908,26 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
 
     /** 随机挑一条视频开始看；片库里没有视频时退回全部作品。 */
     private void randomWatch() {
-        // 筛选中/只看已下载时，随机范围就是眼前这份列表；否则用全库
-        boolean filtered = offlineOnly || !filterAuthor.isEmpty() || !query.isEmpty();
-        List<Work> source = filtered ? displayed : allWorks;
+        // 作者筛选 / 只看已下载是明确的「分类」选择，随机范围跟着它们走；
+        // 但搜索框里的关键词只是「在列表里找某一条」，不该把随机池缩到搜出来的那几条 ——
+        // 以前 query 也算筛选，随手搜过一次之后随机观看就一直在那几个作品里打转。
+        boolean scoped = offlineOnly || !filterAuthor.isEmpty();
+        List<Work> source;
+        if (scoped) {
+            // 注意不能用 displayed：它带着关键词过滤。这里按作者/已下载重新挑一份
+            source = Library.filter(allWorks, filterAuthor, "", "all", false);
+            if (offlineOnly) {
+                List<Work> onlyOffline = new ArrayList<>();
+                for (Work work : source) {
+                    if (app.offline.has(work)) {
+                        onlyOffline.add(work);
+                    }
+                }
+                source = onlyOffline;
+            }
+        } else {
+            source = allWorks;
+        }
         List<Work> pool = new ArrayList<>();
         List<Work> unknown = new ArrayList<>();
         for (Work work : source) {
@@ -804,9 +952,13 @@ public final class HomeActivity extends Activity implements LibraryScanner.Liste
             }
         }
         if (pool.isEmpty()) {
-            Ui.toast(this, filtered ? "当前筛选里没有可播放的作品"
+            Ui.toast(this, scoped ? "当前筛选里没有可播放的作品"
                     : (prefs.hasDav() ? "片库里还没有可播放的作品" : "先连接 WebDAV 片库"));
             return;
+        }
+        if (!query.isEmpty()) {
+            // 说清楚随机范围，免得以为「搜索还生效着」
+            Ui.toast(this, "已在全库随机（搜索关键词只用来筛列表）");
         }
         // 整段打乱：随机观看要的是整段随机顺序，而不是只随机一个起点、
         // 之后顺着作者目录连续看下去（那样同一个作者的一堆视频总扎堆在一起）。
